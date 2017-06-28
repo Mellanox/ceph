@@ -34,34 +34,6 @@ class RDMAServerSocketImpl;
 class RDMAStack;
 class RDMAWorker;
 
-enum {
-  l_msgr_rdma_dispatcher_first = 94000,
-
-  l_msgr_rdma_polling,
-  l_msgr_rdma_inflight_tx_chunks,
-  l_msgr_rdma_inqueue_rx_chunks,
-
-  l_msgr_rdma_tx_total_wc,
-  l_msgr_rdma_tx_total_wc_errors,
-  l_msgr_rdma_tx_wc_retry_errors,
-  l_msgr_rdma_tx_wc_wr_flush_errors,
-
-  l_msgr_rdma_rx_total_wc,
-  l_msgr_rdma_rx_total_wc_errors,
-  l_msgr_rdma_rx_fin,
-
-  l_msgr_rdma_handshake_errors,
-
-  l_msgr_rdma_total_async_events,
-  l_msgr_rdma_async_last_wqe_events,
-
-  l_msgr_rdma_created_queue_pair,
-  l_msgr_rdma_active_queue_pair,
-
-  l_msgr_rdma_dispatcher_last,
-};
-
-
 class RDMADispatcher {
   typedef Infiniband::MemoryManager::Chunk Chunk;
   typedef Infiniband::QueuePair QueuePair;
@@ -75,6 +47,7 @@ class RDMADispatcher {
   bool done = false;
   std::atomic<uint64_t> num_dead_queue_pair = {0};
   std::atomic<uint64_t> num_qp_conn = {0};
+  int post_backlog = 0;
   Mutex lock; // protect `qp_conns`, `dead_queue_pairs`
   // qp_num -> InfRcConnection
   // The main usage of `qp_conns` is looking up connection by qp_num,
@@ -127,10 +100,11 @@ class RDMADispatcher {
   int register_qp(QueuePair *qp, RDMAConnectedSocketImpl* csi);
   void make_pending_worker(RDMAWorker* w) {
     Mutex::Locker l(w_lock);
-    if (pending_workers.back() != w) {
-      pending_workers.push_back(w);
-      ++num_pending_workers;
-    }
+    auto it = std::find(pending_workers.begin(), pending_workers.end(), w);
+    if (it != pending_workers.end())
+      return;
+    pending_workers.push_back(w);
+    ++num_pending_workers;
   }
   RDMAStack* get_stack() { return stack; }
   RDMAConnectedSocketImpl* get_conn_lockless(uint32_t qp);
@@ -142,24 +116,8 @@ class RDMADispatcher {
   void handle_tx_event(ibv_wc *cqe, int n);
   void post_tx_buffer(std::vector<Chunk*> &chunks);
 
-  std::atomic<uint64_t> inflight = {0};
-};
+  void post_chunk_to_pool(Chunk* chunk); 
 
-
-enum {
-  l_msgr_rdma_first = 95000,
-
-  l_msgr_rdma_tx_no_mem,
-  l_msgr_rdma_tx_parital_mem,
-  l_msgr_rdma_tx_failed,
-  l_msgr_rdma_rx_no_registered_mem,
-
-  l_msgr_rdma_tx_chunks,
-  l_msgr_rdma_tx_bytes,
-  l_msgr_rdma_rx_chunks,
-  l_msgr_rdma_rx_bytes,
-
-  l_msgr_rdma_last,
 };
 
 class RDMAWorker : public Worker {
@@ -229,6 +187,7 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   EventCallbackRef con_handler;
   int tcp_fd = -1;
   bool active;// qp is active ?
+  bool pending;
 
   void notify();
   ssize_t read_buffers(char* buf, size_t len);
@@ -258,7 +217,8 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   void cleanup();
   void set_accept_fd(int sd);
   int try_connect(const entity_addr_t&, const SocketOptions &opt);
-
+  bool is_pending() {return pending;}
+  void set_pending(bool val) {pending = val;}
   class C_handle_connection : public EventCallback {
     RDMAConnectedSocketImpl *csi;
     bool active;
@@ -295,8 +255,9 @@ class RDMAServerSocketImpl : public ServerSocketImpl {
 
 class RDMAStack : public NetworkStack {
   vector<std::thread> threads;
-  RDMADispatcher *dispatcher;
   PerfCounters *perf_counter;
+  Infiniband ib;
+  RDMADispatcher dispatcher;
 
   std::atomic<bool> fork_finished = {false};
 
@@ -308,10 +269,11 @@ class RDMAStack : public NetworkStack {
 
   virtual void spawn_worker(unsigned i, std::function<void ()> &&func) override;
   virtual void join_worker(unsigned i) override;
-  RDMADispatcher *get_dispatcher() { return dispatcher; }
-
+  RDMADispatcher &get_dispatcher() { return dispatcher; }
+  Infiniband &get_infiniband() { return ib; }
   virtual bool is_ready() override { return fork_finished.load(); };
   virtual void ready() override { fork_finished = true; };
 };
+
 
 #endif
