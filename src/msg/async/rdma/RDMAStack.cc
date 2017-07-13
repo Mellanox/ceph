@@ -196,9 +196,8 @@ void RDMADispatcher::polling()
         Chunk* chunk = reinterpret_cast<Chunk *>(response->wr_id);
         ldout(cct, 25) << __func__ << " got chunk=" << chunk << " bytes:" << response->byte_len << " opcode:" << response->opcode << dendl;
 
-        assert(wc[i].opcode == IBV_WC_RECV);
-
         if (response->status == IBV_WC_SUCCESS) {
+	  assert(wc[i].opcode == IBV_WC_RECV);
           conn = get_conn_lockless(response->qp_num);
           if (!conn) {
             ldout(cct, 1) << __func__ << " csi with qpn " << response->qp_num << " may be dead. chunk " << chunk << " will be back ? " << r << dendl;
