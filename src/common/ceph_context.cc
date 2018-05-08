@@ -13,37 +13,21 @@
  *
  */
 
-#include <time.h>
-
 #include <boost/algorithm/string.hpp>
 
 #include "include/mempool.h"
 #include "common/admin_socket.h"
 #include "common/perf_counters.h"
-#include "common/Thread.h"
 #include "common/code_environment.h"
-#include "common/ceph_context.h"
 #include "common/ceph_crypto.h"
-#include "common/config.h"
-#include "common/debug.h"
 #include "common/HeartbeatMap.h"
 #include "common/errno.h"
-#include "common/lockdep.h"
-#include "common/Formatter.h"
 #include "common/Graylog.h"
-#include "log/Log.h"
 #include "auth/Crypto.h"
 #include "include/str_list.h"
-#include "common/Mutex.h"
-#include "common/Cond.h"
 #include "common/PluginRegistry.h"
-#include "common/valgrind.h"
 
-#include <iostream>
-#include <pthread.h>
-
-#include "include/Spinlock.h"
-
+using ceph::bufferlist;
 using ceph::HeartbeatMap;
 
 namespace {
@@ -211,6 +195,7 @@ public:
       "log_max_recent",
       "log_to_syslog",
       "err_to_syslog",
+      "log_stderr_prefix",
       "log_to_stderr",
       "err_to_stderr",
       "log_to_graylog",
@@ -244,6 +229,10 @@ public:
       log->reopen_log_file();
     }
 
+    if (changed.count("log_stderr_prefix")) {
+      log->set_log_stderr_prefix(conf->get_val<string>("log_stderr_prefix"));
+    }
+
     if (changed.count("log_max_new")) {
 
       log->set_max_new(conf->log_max_new);
@@ -275,7 +264,7 @@ public:
     }
 
     if (log->graylog() && changed.count("fsid")) {
-      log->graylog()->set_fsid(conf->fsid);
+      log->graylog()->set_fsid(conf->get_val<uuid_d>("fsid"));
     }
   }
 };
@@ -464,6 +453,27 @@ void CephContext::do_command(std::string command, cmdmap_t& cmdmap,
 	    f->dump_string(var.c_str(), buf);
 	}
       }
+    } else if (command == "config help") {
+      std::string var;
+      if (cmd_getval(this, cmdmap, "var", var)) {
+        // Output a single one
+        std::string key = ConfFile::normalize_key_name(var);
+        const auto &i = _conf->schema.find(key);
+        if (i == _conf->schema.end()) {
+          std::ostringstream msg;
+          msg << "Setting not found: '" << key << "'";
+          f->dump_string("error", msg.str());
+        } else {
+          i->second.dump(f);
+        }
+      } else {
+        // Output all
+        f->open_array_section("options");
+        for (const auto &option : ceph_options) {
+          option.dump(f);
+        }
+        f->close_section();
+      }
     } else if (command == "config diff") {
       md_config_t def_conf;
       def_conf.set_val("cluster", _conf->cluster);
@@ -496,6 +506,35 @@ void CephContext::do_command(std::string command, cmdmap_t& cmdmap,
         f->dump_string("option", *p);
       }
       f->close_section(); // unknown
+    } else if (command == "config diff get") {
+      std::string setting;
+      if (!cmd_getval(this, cmdmap, "var", setting)) {
+        f->dump_string("error", "syntax error: 'config diff get <var>'");
+      } else {
+        md_config_t def_conf;
+        def_conf.set_val("cluster", _conf->cluster);
+        def_conf.name = _conf->name;
+        def_conf.set_val("host", _conf->host);
+        def_conf.apply_changes(NULL);
+
+        map<string, pair<string, string>> diff;
+        set<string> unknown;
+        def_conf.diff(_conf, &diff, &unknown, setting);
+        f->open_object_section("diff");
+        f->open_object_section("current");
+
+        for (const auto& p : diff) {
+          f->dump_string(p.first.c_str(), p.second.second);
+        } 
+        f->close_section();   //-- current
+
+        f->open_object_section("defaults");
+        for (const auto& p : diff) {
+          f->dump_string(p.first.c_str(), p.second.first);
+        } 
+        f->close_section();   //-- defaults
+        f->close_section();   //-- diff
+      } 
     } else if (command == "log flush") {
       _log->flush();
     }
@@ -516,10 +555,11 @@ void CephContext::do_command(std::string command, cmdmap_t& cmdmap,
 		         << "result is " << out->length() << " bytes" << dendl;
 }
 
-
-CephContext::CephContext(uint32_t module_type_, int init_flags_)
+CephContext::CephContext(uint32_t module_type_,
+                         enum code_environment_t code_env,
+                         int init_flags_)
   : nref(1),
-    _conf(new md_config_t()),
+    _conf(new md_config_t(code_env == CODE_ENVIRONMENT_DAEMON)),
     _log(NULL),
     _module_type(module_type_),
     _init_flags(init_flags_),
@@ -577,11 +617,15 @@ CephContext::CephContext(uint32_t module_type_, int init_flags_)
   _admin_socket->register_command("perf histogram schema", "perf histogram schema", _admin_hook, "dump perf histogram schema");
   _admin_socket->register_command("perf reset", "perf reset name=var,type=CephString", _admin_hook, "perf reset <name>: perf reset all or one perfcounter name");
   _admin_socket->register_command("config show", "config show", _admin_hook, "dump current config settings");
+  _admin_socket->register_command("config help", "config help name=var,type=CephString,req=false", _admin_hook, "get config setting schema and descriptions");
   _admin_socket->register_command("config set", "config set name=var,type=CephString name=val,type=CephString,n=N",  _admin_hook, "config set <field> <val> [<val> ...]: set a config variable");
   _admin_socket->register_command("config get", "config get name=var,type=CephString", _admin_hook, "config get <field>: get the config value");
   _admin_socket->register_command("config diff",
       "config diff", _admin_hook,
       "dump diff of current config and default config");
+  _admin_socket->register_command("config diff get",
+      "config diff get name=var,type=CephString", _admin_hook,
+      "dump diff get <field>: dump diff of current and default config setting <field>");
   _admin_socket->register_command("log flush", "log flush", _admin_hook, "flush log entries to log file");
   _admin_socket->register_command("log dump", "log dump", _admin_hook, "dump recent log entries to log file");
   _admin_socket->register_command("log reopen", "log reopen", _admin_hook, "reopen log file");
@@ -610,16 +654,20 @@ CephContext::~CephContext()
   delete _plugin_registry;
 
   _admin_socket->unregister_command("perfcounters_dump");
-  _admin_socket->unregister_command("perf dump");
   _admin_socket->unregister_command("1");
+  _admin_socket->unregister_command("perf dump");
   _admin_socket->unregister_command("perfcounters_schema");
-  _admin_socket->unregister_command("perf schema");
+  _admin_socket->unregister_command("perf histogram dump");
   _admin_socket->unregister_command("2");
+  _admin_socket->unregister_command("perf schema");
+  _admin_socket->unregister_command("perf histogram schema");
   _admin_socket->unregister_command("perf reset");
   _admin_socket->unregister_command("config show");
   _admin_socket->unregister_command("config set");
   _admin_socket->unregister_command("config get");
+  _admin_socket->unregister_command("config help");
   _admin_socket->unregister_command("config diff");
+  _admin_socket->unregister_command("config diff get");
   _admin_socket->unregister_command("log flush");
   _admin_socket->unregister_command("log dump");
   _admin_socket->unregister_command("log reopen");
@@ -664,7 +712,7 @@ CephContext::~CephContext()
 }
 
 void CephContext::put() {
-  if (nref.dec() == 0) {
+  if (--nref == 0) {
     ANNOTATE_HAPPENS_AFTER(&nref);
     ANNOTATE_HAPPENS_BEFORE_FORGET_ALL(&nref);
     delete this;

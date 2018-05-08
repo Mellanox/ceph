@@ -12,12 +12,16 @@
  * 
  */
 
+#include "common/debug.h"
+#include "mon/health_check.h"
 
 #include "MDSMap.h"
 
 #include <sstream>
 using std::stringstream;
 
+#define dout_context g_ceph_context
+#define dout_subsys ceph_subsys_
 
 // features
 CompatSet get_mdsmap_compat_set_all() {
@@ -178,8 +182,8 @@ void MDSMap::dump(Formatter *f) const
   }
   f->close_section();
   f->open_array_section("data_pools");
-  for (set<int64_t>::const_iterator p = data_pools.begin(); p != data_pools.end(); ++p)
-    f->dump_int("pool", *p);
+  for (const auto p: data_pools)
+    f->dump_int("pool", p);
   f->close_section();
   f->dump_int("metadata_pool", metadata_pool);
   f->dump_bool("enabled", enabled);
@@ -192,7 +196,7 @@ void MDSMap::generate_test_instances(list<MDSMap*>& ls)
 {
   MDSMap *m = new MDSMap();
   m->max_mds = 1;
-  m->data_pools.insert(0);
+  m->data_pools.push_back(0);
   m->metadata_pool = 1;
   m->cas_pool = 2;
   m->compat = get_mdsmap_compat_set_all();
@@ -404,6 +408,51 @@ void MDSMap::get_health(list<pair<health_status_t,string> >& summary,
   }
 }
 
+void MDSMap::get_health_checks(health_check_map_t *checks) const
+{
+  // MDS_DAMAGE
+  if (!damaged.empty()) {
+    health_check_t& check = checks->get_or_add("MDS_DAMAGE", HEALTH_ERR,
+					"%num% mds daemon%plurals% damaged");
+    for (auto p : damaged) {
+      std::ostringstream oss;
+      oss << "fs " << fs_name << " mds." << p << " is damaged";
+      check.detail.push_back(oss.str());
+    }
+  }
+
+  // FS_DEGRADED
+  if (is_degraded()) {
+    health_check_t& fscheck = checks->get_or_add(
+      "FS_DEGRADED", HEALTH_WARN,
+      "%num% filesystem%plurals% %isorare% degraded");
+    ostringstream ss;
+    ss << "fs " << fs_name << " is degraded";
+    fscheck.detail.push_back(ss.str());
+
+    list<string> detail;
+    for (mds_rank_t i = mds_rank_t(0); i< get_max_mds(); i++) {
+      if (!is_up(i))
+	continue;
+      mds_gid_t gid = up.find(i)->second;
+      map<mds_gid_t,mds_info_t>::const_iterator info = mds_info.find(gid);
+      stringstream ss;
+      ss << "fs " << fs_name << " mds." << info->second.name << " at "
+	 << info->second.addr << " rank " << i;
+      if (is_resolve(i))
+	ss << " is resolving";
+      if (is_replay(i))
+	ss << " is replaying journal";
+      if (is_rejoin(i))
+	ss << " is rejoining";
+      if (is_reconnect(i))
+	ss << " is reconnecting to clients";
+      if (ss.str().length())
+	detail.push_back(ss.str());
+    }
+  }
+}
+
 void MDSMap::mds_info_t::encode_versioned(bufferlist& bl, uint64_t features) const
 {
   ENCODE_START(7, 4, bl);
@@ -467,7 +516,13 @@ void MDSMap::mds_info_t::decode(bufferlist::iterator& bl)
   DECODE_FINISH(bl);
 }
 
-
+std::string MDSMap::mds_info_t::human_name() const
+{
+  // Like "daemon mds.myhost restarted", "Activating daemon mds.myhost"
+  std::ostringstream out;
+  out << "daemon mds." << name;
+  return out.str();
+}
 
 void MDSMap::encode(bufferlist& bl, uint64_t features) const
 {
@@ -498,8 +553,8 @@ void MDSMap::encode(bufferlist& bl, uint64_t features) const
     }
     n = data_pools.size();
     ::encode(n, bl);
-    for (set<int64_t>::const_iterator p = data_pools.begin(); p != data_pools.end(); ++p) {
-      n = *p;
+    for (const auto p: data_pools) {
+      n = p;
       ::encode(n, bl);
     }
 
@@ -582,6 +637,23 @@ void MDSMap::encode(bufferlist& bl, uint64_t features) const
   ENCODE_FINISH(bl);
 }
 
+void MDSMap::sanitize(std::function<bool(int64_t pool)> pool_exists)
+{
+  /* Before we did stricter checking, it was possible to remove a data pool
+   * without also deleting it from the MDSMap. Check for that here after
+   * decoding the data pools.
+   */
+
+  for (auto it = data_pools.begin(); it != data_pools.end();) {
+    if (!pool_exists(*it)) {
+      dout(0) << "removed non-existant data pool " << *it << " from MDSMap" << dendl;
+      it = data_pools.erase(it);
+    } else {
+      it++;
+    }
+  }
+}
+
 void MDSMap::decode(bufferlist::iterator& p)
 {
   std::map<mds_rank_t,int32_t> inc;  // Legacy field, parse and drop
@@ -603,7 +675,7 @@ void MDSMap::decode(bufferlist::iterator& p)
     while (n--) {
       __u32 m;
       ::decode(m, p);
-      data_pools.insert(m);
+      data_pools.push_back(m);
     }
     __s32 s;
     ::decode(s, p);

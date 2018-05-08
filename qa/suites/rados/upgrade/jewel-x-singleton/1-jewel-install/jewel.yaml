@@ -7,4 +7,7 @@ tasks:
 - print: "**** done install jewel"
 - ceph:
     skip_mgr_daemons: true
+    add_osds_to_crush: true
+    log-whitelist:
+      - required past_interval bounds are empty
 - print: "**** done ceph"

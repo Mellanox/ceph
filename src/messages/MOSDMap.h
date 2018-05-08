@@ -28,7 +28,7 @@ class MOSDMap : public Message {
   uuid_d fsid;
   map<epoch_t, bufferlist> maps;
   map<epoch_t, bufferlist> incremental_maps;
-  epoch_t oldest_map, newest_map;
+  epoch_t oldest_map =0, newest_map = 0;
 
   epoch_t get_first() const {
     epoch_t e = 0;
@@ -86,7 +86,8 @@ public:
 	(features & CEPH_FEATURE_PGPOOL3) == 0 ||
 	(features & CEPH_FEATURE_OSDENC) == 0 ||
         (features & CEPH_FEATURE_OSDMAP_ENC) == 0 ||
-	(features & CEPH_FEATURE_MSG_ADDR2) == 0) {
+	(features & CEPH_FEATURE_MSG_ADDR2) == 0 ||
+	!HAVE_FEATURE(features, SERVER_LUMINOUS)) {
       if ((features & CEPH_FEATURE_PGID64) == 0 ||
 	  (features & CEPH_FEATURE_PGPOOL3) == 0)
 	header.version = 1;  // old old_client version
@@ -111,6 +112,14 @@ public:
 	  m.decode(inc.fullmap);
 	  inc.fullmap.clear();
 	  m.encode(inc.fullmap, features | CEPH_FEATURE_RESERVED);
+	}
+	if (inc.crush.length()) {
+	  // embedded crush map
+	  CrushWrapper c;
+	  auto p = inc.crush.begin();
+	  c.decode(p);
+	  inc.crush.clear();
+	  c.encode(inc.crush, features);
 	}
 	inc.encode(p->second, features | CEPH_FEATURE_RESERVED);
       }

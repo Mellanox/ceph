@@ -24,11 +24,11 @@ int RGWCivetWebFrontend::process(struct mg_connection*  const conn)
 
   RGWCivetWeb cw_client(conn);
   auto real_client_io = rgw::io::add_reordering(
-                          rgw::io::add_buffering(
+                          rgw::io::add_buffering(dout_context,
                             rgw::io::add_chunking(
                               rgw::io::add_conlen_controlling(
                                 &cw_client))));
-  RGWRestfulIO client_io(&real_client_io);
+  RGWRestfulIO client_io(dout_context, &real_client_io);
 
   RGWRequest req(env.store->get_new_req_id());
   int ret = process_request(env.store, env.rest, &req, env.uri_prefix,
@@ -53,6 +53,7 @@ int RGWCivetWebFrontend::run()
   set_conf_default(conf_map, "enable_keep_alive", "yes");
   set_conf_default(conf_map, "validate_http_method", "no");
   set_conf_default(conf_map, "canonicalize_url_path", "no");
+  set_conf_default(conf_map, "enable_auth_domain_check", "no");
   conf->get_val("port", "80", &port_str);
   std::replace(port_str.begin(), port_str.end(), '+', ',');
   conf_map["listening_ports"] = port_str;

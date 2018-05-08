@@ -228,6 +228,7 @@ cdef extern from "rbd/librbd.h" nogil:
                             uint8_t enabled)
     int rbd_get_stripe_unit(rbd_image_t image, uint64_t *stripe_unit)
     int rbd_get_stripe_count(rbd_image_t image, uint64_t *stripe_count)
+    int rbd_get_create_timestamp(rbd_image_t image, timespec *timestamp)
     int rbd_get_overlap(rbd_image_t image, uint64_t *overlap)
     int rbd_get_id(rbd_image_t image, char *id, size_t id_len)
     int rbd_get_block_name_prefix(rbd_image_t image, char *prefix,
@@ -387,13 +388,18 @@ class Error(Exception):
 
 class OSError(Error):
     """ `OSError` class, derived from `Error` """
-    def __init__(self, errno, strerror):
+    def __init__(self, message, errno=None):
+        super(OSError, self).__init__(message)
         self.errno = errno
-        self.strerror = strerror
 
     def __str__(self):
-        return '[Errno {0}] {1}'.format(self.errno, self.strerror)
+        msg = super(OSError, self).__str__()
+        if self.errno is None:
+            return msg
+        return '[errno {0}] {1}'.format(self.errno, msg)
 
+    def __reduce__(self):
+        return (self.__class__, (self.message, self.errno))
 
 class PermissionError(OSError):
     pass
@@ -487,9 +493,9 @@ cdef make_ex(ret, msg):
     """
     ret = abs(ret)
     if ret in errno_to_exception:
-        return errno_to_exception[ret](ret, msg)
+        return errno_to_exception[ret](msg, errno=ret)
     else:
-        return Error(ret, msg + (": error code %d" % ret))
+        return OSError(msg, errno=ret)
 
 
 cdef rados_ioctx_t convert_ioctx(rados.Ioctx ioctx) except? NULL:
@@ -891,7 +897,7 @@ class RBD(object):
 
     def trash_move(self, ioctx, name, delay=0):
         """
-        Moves an RBD image to the trash.
+        Move an RBD image to the trash.
         :param ioctx: determines which RADOS pool the image is in
         :type ioctx: :class:`rados.Ioctx`
         :param name: the name of the image to remove
@@ -913,7 +919,7 @@ class RBD(object):
 
     def trash_remove(self, ioctx, image_id, force=False):
         """
-        Deletes an RBD image from trash. If image deferment time has not
+        Delete an RBD image from trash. If image deferment time has not
         expired :class:`PermissionError` is raised.
         :param ioctx: determines which RADOS pool the image is in
         :type ioctx: :class:`rados.Ioctx`
@@ -978,7 +984,7 @@ class RBD(object):
 
     def trash_list(self, ioctx):
         """
-        Lists all entries from trash.
+        List all entries from trash.
         :param ioctx: determines which RADOS pool the image is in
         :type ioctx: :class:`rados.Ioctx`
         :returns: :class:`TrashIterator`
@@ -987,7 +993,7 @@ class RBD(object):
 
     def trash_restore(self, ioctx, image_id, name):
         """
-        Restores an RBD image from trash.
+        Restore an RBD image from trash.
         :param ioctx: determines which RADOS pool the image is in
         :type ioctx: :class:`rados.Ioctx`
         :param image_id: the id of the image to restore
@@ -1631,7 +1637,7 @@ cdef class Image(object):
 
     def features(self):
         """
-        Gets the features bitmask of the image.
+        Get the features bitmask of the image.
 
         :returns: int - the features bitmask of the image
         """
@@ -1644,7 +1650,7 @@ cdef class Image(object):
 
     def update_features(self, features, enabled):
         """
-        Updates the features bitmask of the image by enabling/disabling
+        Update the features bitmask of the image by enabling/disabling
         a single feature.  The feature must support the ability to be
         dynamically enabled/disabled.
 
@@ -1665,7 +1671,7 @@ cdef class Image(object):
 
     def overlap(self):
         """
-        Gets the number of overlapping bytes between the image and its parent
+        Get the number of overlapping bytes between the image and its parent
         image. If open to a snapshot, returns the overlap between the snapshot
         and the parent image.
 
@@ -1681,7 +1687,7 @@ cdef class Image(object):
 
     def flags(self):
         """
-        Gets the flags bitmask of the image.
+        Get the flags bitmask of the image.
 
         :returns: int - the flags bitmask of the image
         """
@@ -1694,7 +1700,7 @@ cdef class Image(object):
 
     def is_exclusive_lock_owner(self):
         """
-        Gets the status of the image exclusive lock.
+        Get the status of the image exclusive lock.
 
         :returns: bool - true if the image is exclusively locked
         """
@@ -2144,7 +2150,7 @@ written." % (self.name, ret, length))
 
     def stripe_unit(self):
         """
-        Returns the stripe unit used for the image.
+        Return the stripe unit used for the image.
         """
         cdef uint64_t stripe_unit
         with nogil:
@@ -2155,7 +2161,7 @@ written." % (self.name, ret, length))
 
     def stripe_count(self):
         """
-        Returns the stripe count used for the image.
+        Return the stripe count used for the image.
         """
         cdef uint64_t stripe_count
         with nogil:
@@ -2163,6 +2169,18 @@ written." % (self.name, ret, length))
         if ret != 0:
             raise make_ex(ret, 'error getting stripe count for image %s' % (self.name))
         return stripe_count
+
+    def create_timestamp(self):
+        """
+        Return the create timestamp for the image.
+        """
+        cdef:
+            timespec timestamp
+        with nogil:
+            ret = rbd_get_create_timestamp(self.image, &timestamp)
+        if ret != 0:
+            raise make_ex(ret, 'error getting create timestamp for image: %s' % (self.name))
+        return datetime.fromtimestamp(timestamp.tv_sec)
 
     def flatten(self):
         """
@@ -2175,7 +2193,7 @@ written." % (self.name, ret, length))
 
     def rebuild_object_map(self):
         """
-        Rebuilds the object map for the image HEAD or currently set snapshot
+        Rebuild the object map for the image HEAD or currently set snapshot
         """
         cdef librbd_progress_fn_t prog_cb = &no_op_progress_callback
         with nogil:
@@ -2664,9 +2682,11 @@ written." % (self.name, ret, length))
                     ret = rbd_metadata_get(self.image, _key, value, &size)
                 if ret != -errno.ERANGE:
                     break
+            if ret == -errno.ENOENT:
+                raise KeyError('no metadata %s for image %s' % (key, self.name))
             if ret != 0:
                 raise make_ex(ret, 'error getting metadata %s for image %s' %
-                              (self.key, self.name,))
+                              (key, self.name,))
             return decode_cstr(value)
         finally:
             free(value)
@@ -2690,7 +2710,7 @@ written." % (self.name, ret, length))
 
         if ret != 0:
             raise make_ex(ret, 'error setting metadata %s for image %s' %
-                          (self.key, self.name,))
+                          (key, self.name,))
 
 
     def metadata_remove(self, key):
@@ -2706,9 +2726,11 @@ written." % (self.name, ret, length))
         with nogil:
             ret = rbd_metadata_remove(self.image, _key)
 
+        if ret == -errno.ENOENT:
+            raise KeyError('no metadata %s for image %s' % (key, self.name))
         if ret != 0:
             raise make_ex(ret, 'error removing metadata %s for image %s' %
-                          (self.key, self.name,))
+                          (key, self.name,))
 
     def metadata_list(self):
         """
@@ -2798,6 +2820,10 @@ cdef class MetadataIterator(object):
                 break
             self.get_next_chunk()
 
+    def __dealloc__(self):
+        if self.last_read:
+            free(self.last_read)
+
     def get_next_chunk(self):
         cdef:
             char *c_keys = NULL
@@ -2854,8 +2880,8 @@ cdef class SnapIterator(object):
         self.num_snaps = 10
         while True:
             self.snaps = <rbd_snap_info_t*>realloc_chk(self.snaps,
-                                                   self.num_snaps *
-                                                   sizeof(rbd_snap_info_t))
+                                                       self.num_snaps *
+                                                       sizeof(rbd_snap_info_t))
             with nogil:
                 ret = rbd_snap_list(image.image, self.snaps, &self.num_snaps)
             if ret >= 0:
@@ -2905,12 +2931,18 @@ cdef class TrashIterator(object):
     def __init__(self, ioctx):
         self.ioctx = convert_ioctx(ioctx)
         self.num_entries = 1024
-        self.entries = <rbd_trash_image_info_t *>realloc_chk(NULL,
-            sizeof(rbd_trash_image_info_t) * self.num_entries)
-        with nogil:
-            ret = rbd_trash_list(self.ioctx, self.entries, &self.num_entries)
-        if ret < 0:
-            raise make_ex(ret, 'error listing trash entries')
+        self.entries = NULL
+        while True:
+            self.entries = <rbd_trash_image_info_t*>realloc_chk(self.entries,
+                                                                self.num_entries *
+                                                                sizeof(rbd_trash_image_info_t))
+            with nogil:
+                ret = rbd_trash_list(self.ioctx, self.entries, &self.num_entries)
+            if ret >= 0:
+                self.num_entries = ret
+                break
+            elif ret != -errno.ERANGE:
+                raise make_ex(ret, 'error listing trash entries')
 
     __source_string = ['USER', 'MIRRORING']
 

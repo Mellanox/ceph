@@ -18,11 +18,15 @@ roles:
   - client.1
   - client.2
   - client.3
+- - client.4
 overrides:
   ceph:
     log-whitelist:
     - scrub mismatch
     - ScrubResult
     - wrongly marked
+    - \(MDS_FAILED\)
+    - \(OBJECT_
+    - is unresponsive
     conf:
     fs: xfs

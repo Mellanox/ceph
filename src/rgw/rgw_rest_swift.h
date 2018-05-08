@@ -11,6 +11,7 @@
 #include "rgw_op.h"
 #include "rgw_rest.h"
 #include "rgw_swift_auth.h"
+#include "rgw_http_errors.h"
 
 #include <boost/utility/string_ref.hpp>
 
@@ -36,18 +37,27 @@ public:
 
 class RGWListBuckets_ObjStore_SWIFT : public RGWListBuckets_ObjStore {
   bool need_stats;
+  bool wants_reversed;
   std::string prefix;
+  std::vector<RGWUserBuckets> reverse_buffer;
 
   uint64_t get_default_max() const override {
     return 0;
   }
+
 public:
-  RGWListBuckets_ObjStore_SWIFT() : need_stats(true) {}
+  RGWListBuckets_ObjStore_SWIFT()
+    : need_stats(true),
+      wants_reversed(false) {
+  }
   ~RGWListBuckets_ObjStore_SWIFT() override {}
 
   int get_params() override;
+  void handle_listing_chunk(RGWUserBuckets&& buckets) override;
   void send_response_begin(bool has_buckets) override;
   void send_response_data(RGWUserBuckets& buckets) override;
+  void send_response_data_reversed(RGWUserBuckets& buckets);
+  void dump_bucket_entry(const RGWBucketEnt& obj);
   void send_response_end() override;
 
   bool should_get_stats() override { return need_stats; }
@@ -234,6 +244,7 @@ public:
   void execute() override;
   void send_response() override;
   static void list_swift_data(Formatter& formatter, const md_config_t& config, RGWRados& store);
+  static void list_tempauth_data(Formatter& formatter, const md_config_t& config, RGWRados& store);
   static void list_tempurl_data(Formatter& formatter, const md_config_t& config, RGWRados& store);
   static void list_slo_data(Formatter& formatter, const md_config_t& config, RGWRados& store);
   static bool is_expired(const std::string& expires, CephContext* cct);
@@ -247,6 +258,8 @@ class RGWFormPost : public RGWPostObj_ObjStore {
   bool is_next_file_to_upload() override;
   bool is_integral();
   bool is_non_expired();
+  void get_owner_info(const req_state* s,
+                      RGWUserInfo& owner_info) const;
 
   parts_collection_t ctrl_parts;
   boost::optional<post_form_part> current_data_part;
@@ -377,7 +390,7 @@ public:
   }
   ~RGWHandler_REST_SWIFT() override = default;
 
-  static int validate_bucket_name(const string& bucket);
+  int validate_bucket_name(const string& bucket);
 
   int init(RGWRados *store, struct req_state *s, rgw::io::BasicClient *cio) override;
   int authorize() override;

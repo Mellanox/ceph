@@ -24,7 +24,7 @@ def task(ctx, config):
 
     cluster: (default 'ceph') the name of the cluster to thrash
 
-    min_in: (default 3) the minimum number of OSDs to keep in the
+    min_in: (default 4) the minimum number of OSDs to keep in the
        cluster
 
     min_out: (default 0) the minimum number of OSDs to keep out of the
@@ -149,6 +149,8 @@ def task(ctx, config):
     config['dump_ops_enable'] = config.get('dump_ops_enable', "true")
     # add default value for noscrub_toggle_delay
     config['noscrub_toggle_delay'] = config.get('noscrub_toggle_delay', 2.0)
+    # add default value for random_eio
+    config['random_eio'] = config.get('random_eio', 0.0)
 
     log.info("config is {config}".format(config=str(config)))
 
@@ -197,4 +199,6 @@ def task(ctx, config):
     finally:
         log.info('joining thrashosds')
         thrash_proc.do_join()
+        cluster_manager.wait_for_all_osds_up()
+        cluster_manager.flush_all_pg_stats()
         cluster_manager.wait_for_recovery(config.get('timeout', 360))

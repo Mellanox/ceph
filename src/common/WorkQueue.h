@@ -15,12 +15,11 @@
 #ifndef CEPH_WORKQUEUE_H
 #define CEPH_WORKQUEUE_H
 
-#include "Mutex.h"
 #include "Cond.h"
-#include "Thread.h"
 #include "include/unordered_map.h"
-#include "common/config_obs.h"
 #include "common/HeartbeatMap.h"
+
+#include <atomic>
 
 class CephContext;
 
@@ -374,6 +373,9 @@ public:
     PointerWQ(string n, time_t ti, time_t sti, ThreadPool* p)
       : WorkQueue_(std::move(n), ti, sti), m_pool(p), m_processing(0) {
     }
+    void register_work_queue() {
+      m_pool->add_work_queue(this);
+    }
     void _clear() override {
       assert(m_pool->_lock.is_locked());
       m_items.clear();
@@ -577,7 +579,7 @@ public:
   ContextWQ(const string &name, time_t ti, ThreadPool *tp)
     : ThreadPool::PointerWQ<Context>(name, ti, 0, tp),
       m_lock("ContextWQ::m_lock") {
-    tp->add_work_queue(this);
+    this->register_work_queue();
   }
 
   void queue(Context *ctx, int result = 0) {
@@ -623,9 +625,11 @@ class ShardedThreadPool {
   Cond shardedpool_cond;
   Cond wait_cond;
   uint32_t num_threads;
-  atomic_t stop_threads;
-  atomic_t pause_threads;
-  atomic_t drain_threads;
+
+  std::atomic<bool> stop_threads = { false };
+  std::atomic<bool> pause_threads = { false };
+  std::atomic<bool> drain_threads = { false };
+
   uint32_t num_paused;
   uint32_t num_drained;
 

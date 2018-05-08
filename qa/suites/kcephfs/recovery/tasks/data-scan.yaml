@@ -8,6 +8,9 @@ overrides:
       - error reading sessionmap
       - unmatched fragstat
       - was unreadable, recreating it now
+      - Scrub error on inode
+      - Metadata damage detected
+      - inconsistent rstat on inode
 
 tasks:
   - cephfs_test_runner:

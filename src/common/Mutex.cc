@@ -11,14 +11,10 @@
  * Foundation.  See file COPYING.
  *
  */
-#include <string>
 
 #include "common/Mutex.h"
 #include "common/perf_counters.h"
-#include "common/ceph_context.h"
 #include "common/config.h"
-#include "include/stringify.h"
-#include "include/utime.h"
 #include "common/Clock.h"
 #include "common/valgrind.h"
 
@@ -65,10 +61,11 @@ Mutex::Mutex(const std::string &n, bool r, bool ld,
       _register();
   }
   else {
-    // If the mutex type is PTHREAD_MUTEX_NORMAL, deadlock detection
-    // shall not be provided. Attempting to relock the mutex causes
-    // deadlock. If a thread attempts to unlock a mutex that  it  has not
-    // locked or a mutex which is unlocked, undefined behavior results.
+    // If the mutex type is PTHREAD_MUTEX_DEFAULT, attempting to recursively
+    // lock the mutex results in undefined behavior. Attempting to unlock the
+    // mutex if it was not locked by the calling thread results in undefined
+    // behavior. Attempting to unlock the mutex if it is not locked results in
+    // undefined behavior.
     pthread_mutex_init(&_m, NULL);
   }
 }

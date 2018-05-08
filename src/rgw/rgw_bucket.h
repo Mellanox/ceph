@@ -20,9 +20,6 @@
 #include "common/ceph_time.h"
 #include "rgw_formats.h"
 
-
-using namespace std;
-
 // define as static when RGWBucket implementation compete
 extern void rgw_get_buckets_obj(const rgw_user& user_id, string& buckets_obj_id);
 
@@ -107,10 +104,14 @@ public:
  */
 class RGWUserBuckets
 {
-  map<string, RGWBucketEnt> buckets;
+  std::map<std::string, RGWBucketEnt> buckets;
 
 public:
-  RGWUserBuckets() {}
+  RGWUserBuckets() = default;
+  RGWUserBuckets(RGWUserBuckets&&) = default;
+
+  RGWUserBuckets& operator=(const RGWUserBuckets&) = default;
+
   void encode(bufferlist& bl) const {
     ::encode(buckets, bl);
   }
@@ -175,7 +176,11 @@ extern int rgw_read_user_buckets(RGWRados *store,
 				 bool* is_truncated,
                                  uint64_t default_amount = 1000);
 
-extern int rgw_link_bucket(RGWRados *store, const rgw_user& user_id, rgw_bucket& bucket, real_time creation_time, bool update_entrypoint = true);
+extern int rgw_link_bucket(RGWRados* store,
+                           const rgw_user& user_id,
+                           rgw_bucket& bucket,
+                           ceph::real_time creation_time,
+                           bool update_entrypoint = true);
 extern int rgw_unlink_bucket(RGWRados *store, const rgw_user& user_id,
                              const string& tenant_name, const string& bucket_name, bool update_entrypoint = true);
 
@@ -213,11 +218,11 @@ struct RGWBucketAdminOpState {
 
   void set_max_aio(int value) { max_aio = value; }
 
-  void set_user_id(rgw_user& user_id) {
+  void set_user_id(const rgw_user& user_id) {
     if (!user_id.empty())
       uid = user_id;
   }
-  void set_bucket_name(std::string& bucket_str) {
+  void set_bucket_name(const std::string& bucket_str) {
     bucket_name = bucket_str; 
   }
   void set_object(std::string& object_str) {
@@ -277,7 +282,7 @@ public:
   int init(RGWRados *storage, RGWBucketAdminOpState& op_state);
 
   int check_bad_index_multipart(RGWBucketAdminOpState& op_state,
-          list<rgw_obj_index_key>& objs_to_unlink, std::string *err_msg = NULL);
+              RGWFormatterFlusher& flusher, std::string *err_msg = NULL);
 
   int check_object_index(RGWBucketAdminOpState& op_state,
                          RGWFormatterFlusher& flusher,

@@ -605,6 +605,15 @@ void librados::ObjectReadOperation::cache_evict()
   o->cache_evict();
 }
 
+void librados::ObjectWriteOperation::set_redirect(const std::string& tgt_obj, 
+						  const IoCtx& tgt_ioctx,
+						  uint64_t tgt_version)
+{
+  ::ObjectOperation *o = &impl->o;
+  o->set_redirect(object_t(tgt_obj), tgt_ioctx.io_ctx_impl->snap_seq,
+			  tgt_ioctx.io_ctx_impl->oloc, tgt_version);
+}
+
 void librados::ObjectWriteOperation::tmap_put(const bufferlist &bl)
 {
   ::ObjectOperation *o = &impl->o;
@@ -1472,6 +1481,8 @@ static int translate_flags(int flags)
     op_flags |= CEPH_OSD_FLAG_FULL_TRY;
   if (flags & librados::OPERATION_FULL_FORCE)
     op_flags |= CEPH_OSD_FLAG_FULL_FORCE;
+  if (flags & librados::OPERATION_IGNORE_REDIRECT)
+    op_flags |= CEPH_OSD_FLAG_IGNORE_REDIRECT;
 
   return op_flags;
 }
@@ -2335,6 +2346,20 @@ int librados::Rados::conf_get(const char *option, std::string &val)
   return 0;
 }
 
+int librados::Rados::service_daemon_register(
+  const std::string& service,  ///< service name (e.g., 'rgw')
+  const std::string& name,     ///< daemon name (e.g., 'gwfoo')
+  const std::map<std::string,std::string>& metadata) ///< static metadata about daemon
+{
+  return client->service_daemon_register(service, name, metadata);
+}
+
+int librados::Rados::service_daemon_update_status(
+  const std::map<std::string,std::string>& status)
+{
+  return client->service_daemon_update_status(status);
+}
+
 int librados::Rados::pool_create(const char *name)
 {
   string str(name);
@@ -2610,7 +2635,7 @@ namespace {
     };
     bufferlist inbl, outbl;
     string outstring;
-    int ret = client.mon_command(cmd, inbl, &outbl, &outstring);
+    int ret = client.mgr_command(cmd, inbl, &outbl, &outstring);
     if (ret) {
       return ret;
     }
@@ -3062,6 +3087,128 @@ extern "C" int rados_blacklist_add(rados_t cluster, char *client_address,
   return radosp->blacklist_add(client_address, expire_seconds);
 }
 
+extern "C" int rados_application_enable(rados_ioctx_t io, const char *app_name,
+                                        int force)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  return ctx->application_enable(app_name, force != 0);
+}
+
+extern "C" int rados_application_list(rados_ioctx_t io, char *values,
+                                      size_t *values_len)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  std::set<std::string> app_names;
+  int r = ctx->application_list(&app_names);
+  if (r < 0) {
+    return r;
+  }
+
+  size_t total_len = 0;
+  for (auto app_name : app_names) {
+    total_len += app_name.size() + 1;
+  }
+
+  if (*values_len < total_len) {
+    *values_len = total_len;
+    return -ERANGE;
+  }
+
+  char *values_p = values;
+  for (auto app_name : app_names) {
+    size_t len = app_name.size() + 1;
+    strncpy(values_p, app_name.c_str(), len);
+    values_p += len;
+  }
+  *values_p = '\0';
+  *values_len = total_len;
+  return 0;
+}
+
+extern "C" int rados_application_metadata_get(rados_ioctx_t io,
+                                              const char *app_name,
+                                              const char *key, char *value,
+                                              size_t *value_len)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  std::string value_str;
+  int r = ctx->application_metadata_get(app_name, key, &value_str);
+  if (r < 0) {
+    return r;
+  }
+
+  size_t len = value_str.size() + 1;
+  if (*value_len < len) {
+    *value_len = len;
+    return -ERANGE;
+  }
+
+  strncpy(value, value_str.c_str(), len);
+  *value_len = len;
+  return 0;
+}
+
+extern "C" int rados_application_metadata_set(rados_ioctx_t io,
+                                              const char *app_name,
+                                              const char *key,
+                                              const char *value)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  return ctx->application_metadata_set(app_name, key, value);
+}
+
+extern "C" int rados_application_metadata_remove(rados_ioctx_t io,
+                                                 const char *app_name,
+                                                 const char *key)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  return ctx->application_metadata_remove(app_name, key);
+}
+
+extern "C" int rados_application_metadata_list(rados_ioctx_t io,
+                                               const char *app_name,
+                                               char *keys, size_t *keys_len,
+                                               char *values, size_t *vals_len)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  std::map<std::string, std::string> metadata;
+  int r = ctx->application_metadata_list(app_name, &metadata);
+  if (r < 0) {
+    return r;
+  }
+
+  size_t total_key_len = 0;
+  size_t total_val_len = 0;
+  for (auto pair : metadata) {
+    total_key_len += pair.first.size() + 1;
+    total_val_len += pair.second.size() + 1;
+  }
+
+  if (*keys_len < total_key_len || *vals_len < total_val_len) {
+    *keys_len = total_key_len;
+    *vals_len = total_val_len;
+    return -ERANGE;
+  }
+
+  char *keys_p = keys;
+  char *vals_p = values;
+  for (auto pair : metadata) {
+    size_t key_len = pair.first.size() + 1;
+    strncpy(keys_p, pair.first.c_str(), key_len);
+    keys_p += key_len;
+
+    size_t val_len = pair.second.size() + 1;
+    strncpy(vals_p, pair.second.c_str(), val_len);
+    vals_p += val_len;
+  }
+  *keys_p = '\0';
+  *keys_len = total_key_len;
+
+  *vals_p = '\0';
+  *vals_len = total_val_len;
+  return 0;
+}
+
 extern "C" int rados_pool_list(rados_t cluster, char *buf, size_t len)
 {
   tracepoint(librados, rados_pool_list_enter, cluster, len);
@@ -3144,6 +3291,42 @@ CEPH_RADOS_API int rados_inconsistent_pg_list(rados_t cluster, int64_t pool_id,
   int retval = needed + 1;
   tracepoint(librados, rados_inconsistent_pg_list_exit, retval);
   return retval;
+}
+
+
+static void dict_to_map(const char *dict,
+                        std::map<std::string, std::string>* dict_map)
+{
+  while (*dict != '\0') {
+    const char* key = dict;
+    dict += strlen(key) + 1;
+    const char* value = dict;
+    dict += strlen(value) + 1;
+    (*dict_map)[key] = value;
+  }
+}
+
+CEPH_RADOS_API int rados_service_register(rados_t cluster, const char *service,
+                                          const char *daemon,
+                                          const char *metadata_dict)
+{
+  librados::RadosClient *client = (librados::RadosClient *)cluster;
+
+  std::map<std::string, std::string> metadata;
+  dict_to_map(metadata_dict, &metadata);
+
+  return client->service_daemon_register(service, daemon, metadata);
+}
+
+CEPH_RADOS_API int rados_service_update_status(rados_t cluster,
+                                               const char *status_dict)
+{
+  librados::RadosClient *client = (librados::RadosClient *)cluster;
+
+  std::map<std::string, std::string> status;
+  dict_to_map(status_dict, &status);
+
+  return client->service_daemon_update_status(status);
 }
 
 static void do_out_buffer(bufferlist& outbl, char **outbuf, size_t *outbuflen)
@@ -3364,8 +3547,18 @@ extern "C" int rados_monitor_log(rados_t cluster, const char *level, rados_log_c
 {
   tracepoint(librados, rados_monitor_log_enter, cluster, level, cb, arg);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
-  int retval = client->monitor_log(level, cb, arg);
+  int retval = client->monitor_log(level, cb, nullptr, arg);
   tracepoint(librados, rados_monitor_log_exit, retval);
+  return retval;
+}
+
+extern "C" int rados_monitor_log2(rados_t cluster, const char *level,
+				  rados_log_callback2_t cb, void *arg)
+{
+  tracepoint(librados, rados_monitor_log2_enter, cluster, level, cb, arg);
+  librados::RadosClient *client = (librados::RadosClient *)cluster;
+  int retval = client->monitor_log(level, nullptr, cb, arg);
+  tracepoint(librados, rados_monitor_log2_exit, retval);
   return retval;
 }
 
@@ -6305,4 +6498,50 @@ void librados::IoCtx::object_list_slice(
       (hobject_t*)(split_start->c_cursor),
       (hobject_t*)(split_finish->c_cursor));
 }
+
+int librados::IoCtx::application_enable(const std::string& app_name,
+                                        bool force)
+{
+  return io_ctx_impl->application_enable(app_name, force);
+}
+
+int librados::IoCtx::application_enable_async(const std::string& app_name,
+                                              bool force,
+                                              PoolAsyncCompletion *c)
+{
+  io_ctx_impl->application_enable_async(app_name, force, c->pc);
+  return 0;
+}
+
+int librados::IoCtx::application_list(std::set<std::string> *app_names)
+{
+  return io_ctx_impl->application_list(app_names);
+}
+
+int librados::IoCtx::application_metadata_get(const std::string& app_name,
+                                              const std::string &key,
+                                              std::string* value)
+{
+  return io_ctx_impl->application_metadata_get(app_name, key, value);
+}
+
+int librados::IoCtx::application_metadata_set(const std::string& app_name,
+                                              const std::string &key,
+                                              const std::string& value)
+{
+  return io_ctx_impl->application_metadata_set(app_name, key, value);
+}
+
+int librados::IoCtx::application_metadata_remove(const std::string& app_name,
+                                                 const std::string &key)
+{
+  return io_ctx_impl->application_metadata_remove(app_name, key);
+}
+
+int librados::IoCtx::application_metadata_list(const std::string& app_name,
+                                               std::map<std::string, std::string> *values)
+{
+  return io_ctx_impl->application_metadata_list(app_name, values);
+}
+
 

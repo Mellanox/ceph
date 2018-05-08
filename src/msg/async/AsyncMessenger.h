@@ -26,9 +26,10 @@ using namespace std;
 #include "include/unordered_set.h"
 
 #include "common/Mutex.h"
-#include "include/atomic.h"
 #include "common/Cond.h"
 #include "common/Thread.h"
+
+#include "include/Spinlock.h"
 
 #include "msg/SimplePolicyMessenger.h"
 #include "msg/DispatchQueue.h"
@@ -95,6 +96,7 @@ public:
    * @{
    */
   void set_addr_unknowns(const entity_addr_t &addr) override;
+  void set_addr(const entity_addr_t &addr) override;
 
   int get_dispatch_queue_len() override {
     return dispatch_queue.get_queue_len();
@@ -353,6 +355,8 @@ public:
       // If conn already in, we will return 0
       Mutex::Locker l(deleted_lock);
       if (deleted_conns.erase(existing)) {
+        existing->get_perf_counter()->dec(l_msgr_active_connections);
+        conns.erase(it);
       } else if (conn != existing) {
         return -1;
       }

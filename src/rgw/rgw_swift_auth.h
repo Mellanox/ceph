@@ -49,6 +49,7 @@ class TempURLEngine : public rgw::auth::Engine {
   bool is_expired(const std::string& expires) const;
 
   class SignatureHelper;
+  class PrefixableSignatureHelper;
 
 public:
   TempURLEngine(CephContext* const cct,
@@ -167,7 +168,7 @@ class DefaultStrategy : public rgw::auth::Strategy,
   /* The engines. */
   const rgw::auth::swift::TempURLEngine tempurl_engine;
   const rgw::auth::swift::SignedTokenEngine signed_engine;
-  const rgw::auth::keystone::TokenEngine keystone_engine;
+  boost::optional <const rgw::auth::keystone::TokenEngine> keystone_engine;
   const rgw::auth::swift::ExternalTokenEngine external_engine;
   const rgw::auth::swift::SwiftAnonymousEngine anon_engine;
 
@@ -228,11 +229,6 @@ public:
                     store,
                     static_cast<rgw::auth::TokenExtractor*>(this),
                     static_cast<rgw::auth::LocalApplier::Factory*>(this)),
-      keystone_engine(cct,
-                      static_cast<rgw::auth::TokenExtractor*>(this),
-                      static_cast<rgw::auth::RemoteApplier::Factory*>(this),
-                      keystone_config_t::get_instance(),
-                      keystone_cache_t::get_instance<keystone_config_t>()),
       external_engine(cct,
                       store,
                       static_cast<rgw::auth::TokenExtractor*>(this),
@@ -250,7 +246,13 @@ public:
     /* The auth strategy is responsible for deciding whether a parcular
      * engine is disabled or not. */
     if (! cct->_conf->rgw_keystone_url.empty()) {
-      add_engine(Control::SUFFICIENT, keystone_engine);
+      keystone_engine.emplace(cct,
+                              static_cast<rgw::auth::TokenExtractor*>(this),
+                              static_cast<rgw::auth::RemoteApplier::Factory*>(this),
+                              keystone_config_t::get_instance(),
+                              keystone_cache_t::get_instance<keystone_config_t>());
+
+      add_engine(Control::SUFFICIENT, *keystone_engine);
     }
     if (! cct->_conf->rgw_swift_auth_url.empty()) {
       add_engine(Control::SUFFICIENT, external_engine);

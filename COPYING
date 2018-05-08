@@ -30,10 +30,6 @@ Files: src/common/bloom_filter.hpp
 Copyright: Copyright (C) 2000 Arash Partow <arash@partow.net>
 License: Boost Software License, Version 1.0
 
-Files: m4/acx_pthread.m4
-Copyright: Steven G. Johnson <stevenj@alum.mit.edu>
-License: GPLWithACException
-
 Files: src/common/crc32c_intel*:
 Copyright:
     Copyright 2012-2013 Intel Corporation All Rights Reserved.
@@ -149,8 +145,3 @@ Files: src/include/timegm.h
   Copyright (C) Copyright Howard Hinnant
   Copyright (C) Copyright 2010-2011 Vicente J. Botet Escriba
   License: Boost Software License, Version 1.0
-
-Files: src/msg/async/AsyncConnection.cc, src/msg/simple/Pipe.cc (sigpipe suppression)
-  Copyright (C) 2010 Tomash Brechko.  All rights reserved.
-  License: GPL3
-

@@ -21,10 +21,12 @@
 #include "include/types.h"
 #include "common/Clock.h"
 #include "msg/Message.h"
+#include "include/health.h"
 
 #include <set>
 #include <map>
 #include <string>
+#include <algorithm>
 
 #include "common/config.h"
 
@@ -57,6 +59,7 @@
 */
 
 class CephContext;
+class health_check_map_t;
 
 extern CompatSet get_mdsmap_compat_set_all();
 extern CompatSet get_mdsmap_compat_set_default();
@@ -70,7 +73,7 @@ extern CompatSet get_mdsmap_compat_set_base(); // pre v0.20
 #define MDS_FEATURE_INCOMPAT_OMAPDIRFRAG CompatSet::Feature(6, "dirfrag is stored in omap")
 #define MDS_FEATURE_INCOMPAT_INLINE CompatSet::Feature(7, "mds uses inline data")
 #define MDS_FEATURE_INCOMPAT_NOANCHOR CompatSet::Feature(8, "no anchor table")
-#define MDS_FEATURE_INCOMPAT_FILE_LAYOUT_V2 CompatSet::Feature(8, "file layout v2")
+#define MDS_FEATURE_INCOMPAT_FILE_LAYOUT_V2 CompatSet::Feature(9, "file layout v2")
 
 #define MDS_FS_NAME_DEFAULT "cephfs"
 
@@ -132,7 +135,7 @@ public:
     fs_cluster_id_t standby_for_fscid;
     bool standby_replay;
     std::set<mds_rank_t> export_targets;
-    uint64_t mds_features;
+    uint64_t mds_features = 0;
 
     mds_info_t() : global_id(MDS_GID_NONE), rank(MDS_RANK_NONE), inc(0),
                    state(STATE_STANDBY), state_seq(0),
@@ -153,6 +156,10 @@ public:
     void decode(bufferlist::iterator& p);
     void dump(Formatter *f) const;
     void print_summary(ostream &out) const;
+
+    // The long form name for use in cluster log messages`
+    std::string human_name() const;
+
     static void generate_test_instances(list<mds_info_t*>& ls);
   private:
     void encode_versioned(bufferlist& bl, uint64_t features) const;
@@ -178,7 +185,7 @@ protected:
   __u32 session_autoclose;
   uint64_t max_file_size;
 
-  std::set<int64_t> data_pools;  // file data pools available to clients (via an ioctl).  first is the default.
+  std::vector<int64_t> data_pools;  // file data pools available to clients (via an ioctl).  first is the default.
   int64_t cas_pool;            // where CAS objects go
   int64_t metadata_pool;       // where fs metadata objects go
   
@@ -242,6 +249,11 @@ public:
   utime_t get_session_timeout() const {
     return utime_t(session_timeout,0);
   }
+
+  utime_t get_session_autoclose() const {
+    return utime_t(session_autoclose, 0);
+  }
+
   uint64_t get_max_filesize() const { return max_file_size; }
   void set_max_filesize(uint64_t m) { max_file_size = m; }
   
@@ -309,11 +321,14 @@ public:
   mds_rank_t get_tableserver() const { return tableserver; }
   mds_rank_t get_root() const { return root; }
 
-  const std::set<int64_t> &get_data_pools() const { return data_pools; }
+  const std::vector<int64_t> &get_data_pools() const { return data_pools; }
   int64_t get_first_data_pool() const { return *data_pools.begin(); }
   int64_t get_metadata_pool() const { return metadata_pool; }
   bool is_data_pool(int64_t poolid) const {
-    return data_pools.count(poolid);
+    auto p = std::find(data_pools.begin(), data_pools.end(), poolid);
+    if (p == data_pools.end())
+      return false;
+    return true;
   }
 
   bool pool_in_use(int64_t poolid) const {
@@ -346,6 +361,10 @@ public:
   unsigned get_num_up_mds() const {
     return up.size();
   }
+  mds_rank_t get_last_in_mds() const {
+    auto p = in.rbegin();
+    return p == in.rend() ? MDS_RANK_NONE : *p;
+  }
   int get_num_failed_mds() const {
     return failed.size();
   }
@@ -360,10 +379,10 @@ public:
 
   // data pools
   void add_data_pool(int64_t poolid) {
-    data_pools.insert(poolid);
+    data_pools.push_back(poolid);
   }
   int remove_data_pool(int64_t poolid) {
-    std::set<int64_t>::iterator p = data_pools.find(poolid);
+    std::vector<int64_t>::iterator p = std::find(data_pools.begin(), data_pools.end(), poolid);
     if (p == data_pools.end())
       return -ENOENT;
     data_pools.erase(p);
@@ -455,6 +474,8 @@ public:
 
   void get_health(list<pair<health_status_t,std::string> >& summary,
 		  list<pair<health_status_t,std::string> > *detail) const;
+
+  void get_health_checks(health_check_map_t *checks) const;
 
   typedef enum
   {
@@ -644,7 +665,7 @@ public:
     bufferlist::iterator p = bl.begin();
     decode(p);
   }
-
+  void sanitize(std::function<bool(int64_t pool)> pool_exists);
 
   void print(ostream& out) const;
   void print_summary(Formatter *f, ostream *out) const;

@@ -63,6 +63,7 @@ public:
   explicit MonClientHelper(CephContext *cct_)
     : Dispatcher(cct_),
       cct(cct_),
+      msg(NULL),
       monc(cct_),
       lock("mon-msg-test::lock")
   { }
@@ -219,7 +220,7 @@ class MonMsgTest : public MonClientHelper,
 {
 protected:
   int reply_type;
-  Message *reply_msg;
+  Message *reply_msg = nullptr;
   Mutex lock;
   Cond cond;
 
@@ -232,7 +233,7 @@ public:
     reply_type = -1;
     if (reply_msg) {
       reply_msg->put();
-      reply_msg = NULL;
+      reply_msg = nullptr;
     }
     ASSERT_EQ(init(), 0);
   }
@@ -241,7 +242,7 @@ public:
     shutdown();
     if (reply_msg) {
       reply_msg->put();
-      reply_msg = NULL;
+      reply_msg = nullptr;
     }
   }
 
@@ -279,7 +280,7 @@ public:
     }
 
     if (!reply_msg)
-      dout(20) << __func__ << " reply_msg is NULL" << dendl;
+      dout(20) << __func__ << " reply_msg is nullptr" << dendl;
     else
       dout(20) << __func__ << " reply_msg " << *reply_msg << dendl;
     return reply_msg;

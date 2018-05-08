@@ -42,6 +42,7 @@ def setup_module():
     rados.create_pool(pool_name)
     global ioctx
     ioctx = rados.open_ioctx(pool_name)
+    ioctx.application_enable('rbd')
     global features
     features = os.getenv("RBD_FEATURES")
     features = int(features) if features is not None else 61
@@ -334,6 +335,11 @@ class TestImage(object):
 
     def test_block_name_prefix(self):
         assert_not_equal(b'', self.image.block_name_prefix())
+
+    def test_create_timestamp(self):
+        timestamp = self.image.create_timestamp()
+        assert_not_equal(0, timestamp.year)
+        assert_not_equal(1970, timestamp.year)
 
     def test_invalidate_cache(self):
         self.image.write(b'abc', 0)
@@ -822,6 +828,7 @@ class TestImage(object):
     def test_metadata(self):
         metadata = list(self.image.metadata_list())
         eq(len(metadata), 0)
+        assert_raises(KeyError, self.image.metadata_get, "key1")
         self.image.metadata_set("key1", "value1")
         self.image.metadata_set("key2", "value2")
         value = self.image.metadata_get("key1")
@@ -835,6 +842,7 @@ class TestImage(object):
         eq(len(metadata), 1)
         eq(metadata[0], ("key2", "value2"))
         self.image.metadata_remove("key2")
+        assert_raises(KeyError, self.image.metadata_remove, "key2")
         metadata = list(self.image.metadata_list())
         eq(len(metadata), 0)
 
@@ -944,6 +952,7 @@ class TestClone(object):
         pool_name2 = get_temp_pool_name()
         rados.create_pool(pool_name2)
         other_ioctx = rados.open_ioctx(pool_name2)
+        other_ioctx.application_enable('rbd')
 
         # ...with a clone of the same parent
         other_clone_name = get_temp_image_name()

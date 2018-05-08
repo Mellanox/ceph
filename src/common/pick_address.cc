@@ -13,39 +13,88 @@
  */
 
 #include "common/pick_address.h"
-
-#include <netdb.h>
-#include <errno.h>
-
 #include "include/ipaddr.h"
 #include "include/str_list.h"
 #include "common/debug.h"
 #include "common/errno.h"
 
+#include <netdb.h>
+
 #define dout_subsys ceph_subsys_
 
-static const struct sockaddr *find_ip_in_subnet_list(CephContext *cct,
-						     const struct ifaddrs *ifa,
-						     const std::string &networks)
+const struct sockaddr *find_ip_in_subnet_list(
+  CephContext *cct,
+  const struct ifaddrs *ifa,
+  const std::string &networks,
+  const std::string &interfaces)
 {
   std::list<string> nets;
   get_str_list(networks, nets);
+  std::list<string> ifs;
+  get_str_list(interfaces, ifs);
 
-  for(std::list<string>::iterator s = nets.begin(); s != nets.end(); ++s) {
-      struct sockaddr_storage net;
-      unsigned int prefix_len;
-
-      if (!parse_network(s->c_str(), &net, &prefix_len)) {
-	lderr(cct) << "unable to parse network: " << *s << dendl;
-	exit(1);
+  // filter interfaces by name
+  const struct ifaddrs *filtered = 0;
+  if (ifs.empty()) {
+    filtered = ifa;
+  } else {
+    if (nets.empty()) {
+      lderr(cct) << "interface names specified but not network names" << dendl;
+      exit(1);
+    }
+    const struct ifaddrs *t = ifa;
+    struct ifaddrs *head = 0;
+    while (t != NULL) {
+      bool match = false;
+      for (auto& i : ifs) {
+	if (strcmp(i.c_str(), t->ifa_name) == 0) {
+	  match = true;
+	  break;
+	}
       }
+      if (match) {
+	struct ifaddrs *n = new ifaddrs;
+	memcpy(n, t, sizeof(*t));
+	n->ifa_next = head;
+	head = n;
+      }
+      t = t->ifa_next;
+    }
+    if (head == NULL) {
+      lderr(cct) << "no interfaces matching " << ifs << dendl;
+      exit(1);
+    }
+    filtered = head;
+  }
 
-      const struct sockaddr *found = find_ip_in_subnet(ifa, (struct sockaddr *) &net, prefix_len);
-      if (found)
-	return found;
+  struct sockaddr *r = NULL;
+  for (std::list<string>::iterator s = nets.begin(); s != nets.end(); ++s) {
+    struct sockaddr_storage net;
+    unsigned int prefix_len;
+
+    if (!parse_network(s->c_str(), &net, &prefix_len)) {
+      lderr(cct) << "unable to parse network: " << *s << dendl;
+      exit(1);
     }
 
-  return NULL;
+    const struct ifaddrs *found = find_ip_in_subnet(
+      filtered,
+      (struct sockaddr *) &net, prefix_len);
+    if (found) {
+      r = found->ifa_addr;
+      break;
+    }
+  }
+
+  if (filtered != ifa) {
+    while (filtered) {
+      struct ifaddrs *t = filtered->ifa_next;
+      delete filtered;
+      filtered = t;
+    }
+  }
+
+  return r;
 }
 
 // observe this change
@@ -68,11 +117,14 @@ struct Observer : public md_config_obs_t {
 static void fill_in_one_address(CephContext *cct,
 				const struct ifaddrs *ifa,
 				const string networks,
+				const string interfaces,
 				const char *conf_var)
 {
-  const struct sockaddr *found = find_ip_in_subnet_list(cct, ifa, networks);
+  const struct sockaddr *found = find_ip_in_subnet_list(cct, ifa, networks,
+							interfaces);
   if (!found) {
-    lderr(cct) << "unable to find any IP address in networks: " << networks << dendl;
+    lderr(cct) << "unable to find any IP address in networks '" << networks
+	       << "' interfaces '" << interfaces << "'" << dendl;
     exit(1);
   }
 
@@ -112,28 +164,61 @@ void pick_addresses(CephContext *cct, int needs)
     exit(1);
   }
 
-
   if ((needs & CEPH_PICK_ADDRESS_PUBLIC)
       && cct->_conf->public_addr.is_blank_ip()
       && !cct->_conf->public_network.empty()) {
-    fill_in_one_address(cct, ifa, cct->_conf->public_network, "public_addr");
+    fill_in_one_address(cct, ifa, cct->_conf->public_network,
+			cct->_conf->get_val<string>("public_network_interface"),
+			"public_addr");
   }
 
   if ((needs & CEPH_PICK_ADDRESS_CLUSTER)
       && cct->_conf->cluster_addr.is_blank_ip()) {
     if (!cct->_conf->cluster_network.empty()) {
-      fill_in_one_address(cct, ifa, cct->_conf->cluster_network, "cluster_addr");
+      fill_in_one_address(
+	cct, ifa, cct->_conf->cluster_network,
+	cct->_conf->get_val<string>("cluster_network_interface"),
+	"cluster_addr");
     } else {
       if (!cct->_conf->public_network.empty()) {
         lderr(cct) << "Public network was set, but cluster network was not set " << dendl;
         lderr(cct) << "    Using public network also for cluster network" << dendl;
-        fill_in_one_address(cct, ifa, cct->_conf->public_network, "cluster_addr");
+        fill_in_one_address(
+	  cct, ifa, cct->_conf->public_network,
+	  cct->_conf->get_val<string>("public_network_interface"),
+	  "cluster_addr");
       }
     }
   }
 
   freeifaddrs(ifa);
 }
+
+
+std::string pick_iface(CephContext *cct, const struct sockaddr_storage &network)
+{
+  struct ifaddrs *ifa;
+  int r = getifaddrs(&ifa);
+  if (r < 0) {
+    string err = cpp_strerror(errno);
+    lderr(cct) << "unable to fetch interfaces and addresses: " << err << dendl;
+    return {};
+  }
+
+  const unsigned int prefix_len = max(sizeof(in_addr::s_addr), sizeof(in6_addr::s6_addr)) * CHAR_BIT;
+  const struct ifaddrs *found = find_ip_in_subnet(ifa,
+                                  (const struct sockaddr *) &network, prefix_len);
+
+  std::string result;
+  if (found) {
+    result = found->ifa_name;
+  }
+
+  freeifaddrs(ifa);
+
+  return result;
+}
+
 
 bool have_local_addr(CephContext *cct, const list<entity_addr_t>& ls, entity_addr_t *match)
 {

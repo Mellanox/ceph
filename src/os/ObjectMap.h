@@ -152,7 +152,9 @@ public:
     const SequencerPosition *spos=0   ///< [in] Sequencer
     ) { return 0; }
 
-  virtual int check(std::ostream &out, bool repair = false) { return 0; }
+  virtual int check(std::ostream &out, bool repair = false, bool force = false) { return 0; }
+
+  virtual void compact() {}
 
   typedef KeyValueDB::GenericIteratorImpl ObjectMapIteratorImpl;
   typedef ceph::shared_ptr<ObjectMapIteratorImpl> ObjectMapIterator;

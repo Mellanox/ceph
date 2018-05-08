@@ -256,6 +256,7 @@ protected:
   CephContext *cct;
   OSDriver osdriver;
   SnapMapper snap_mapper;
+  bool eio_errors_to_process = false;
 
   virtual PGBackend *get_pgbackend() = 0;
 public:
@@ -402,8 +403,14 @@ public:
 	*v = i->second.need;
       return true;
     }
+    bool is_deleted(const hobject_t &hoid) const {
+      auto i = needs_recovery_map.find(hoid);
+      if (i == needs_recovery_map.end())
+	return false;
+      return i->second.is_delete();
+    }
     bool is_unfound(const hobject_t &hoid) const {
-      return needs_recovery(hoid) && (
+      return needs_recovery(hoid) && !is_deleted(hoid) && (
 	!missing_loc.count(hoid) ||
 	!(*is_recoverable)(missing_loc.find(hoid)->second));
     }
@@ -454,6 +461,9 @@ public:
 	if (j == needs_recovery_map.end()) {
 	  needs_recovery_map.insert(*i);
 	} else {
+	  lgeneric_dout(pg->cct, 0) << this << " " << pg->info.pgid << " unexpected need for "
+				    << i->first << " have " << j->second
+				    << " tried to add " << i->second << dendl;
 	  assert(i->second.need == j->second.need);
 	}
       }
@@ -521,6 +531,8 @@ public:
 	return; // recovered!
 
       needs_recovery_map[hoid] = *item;
+      if (item->is_delete())
+	return;
       auto mliter =
 	missing_loc.insert(make_pair(hoid, set<pg_shard_t>())).first;
       assert(info.last_backfill.is_max());
@@ -859,6 +871,9 @@ protected:
    *  - waiting_for_active
    *    - !is_active()
    *    - only starts blocking on interval change; never restarts
+   *  - waiting_for_flush
+   *    - is_active() and flushes_in_progress
+   *    - waiting for final flush during activate
    *  - waiting_for_scrub
    *    - starts and stops blocking for varying intervals during scrub
    *  - waiting_for_unreadable_object
@@ -901,10 +916,11 @@ protected:
 
   // ops waiting on active (require peered as well)
   list<OpRequestRef>            waiting_for_active;
+  list<OpRequestRef>            waiting_for_flush;
   list<OpRequestRef>            waiting_for_scrub;
 
   list<OpRequestRef>            waiting_for_cache_not_full;
-  list<OpRequestRef>            waiting_for_all_missing;
+  list<OpRequestRef>            waiting_for_clean_to_primary_repair;
   map<hobject_t, list<OpRequestRef>> waiting_for_unreadable_object,
 			     waiting_for_degraded_object,
 			     waiting_for_blocked_object;
@@ -942,7 +958,6 @@ protected:
 public:
   void clear_primary_state();
 
- public:
   bool is_actingbackfill(pg_shard_t osd) const {
     return actingbackfill.count(osd);
   }
@@ -963,12 +978,15 @@ public:
   bool needs_recovery() const;
   bool needs_backfill() const;
 
+  /// clip calculated priority to reasonable range
+  inline int clamp_recovery_priority(int priority);
   /// get log recovery reservation priority
   unsigned get_recovery_priority();
   /// get backfill reservation priority
   unsigned get_backfill_priority();
 
   void mark_clean();  ///< mark an active pg clean
+  void _change_recovery_force_mode(int new_mode, bool clear);
 
   /// return [start,end) bounds for required past_intervals
   static pair<epoch_t, epoch_t> get_required_past_interval_bounds(
@@ -976,11 +994,11 @@ public:
     epoch_t oldest_map) {
     epoch_t start = MAX(
       info.history.last_epoch_clean ? info.history.last_epoch_clean :
-       info.history.epoch_created,
+       info.history.epoch_pool_created,
       oldest_map);
     epoch_t end = MAX(
       info.history.same_interval_since,
-      info.history.epoch_created);
+      info.history.epoch_pool_created);
     return make_pair(start, end);
   }
   void check_past_interval_bounds() const;
@@ -1080,7 +1098,6 @@ public:
     const vector<int> &up,
     pg_shard_t up_primary,
     const map<pg_shard_t, pg_info_t> &all_info,
-    bool compat_mode,
     bool restrict_to_up_acting,
     vector<int> *want,
     set<pg_shard_t> *backfill,
@@ -1095,7 +1112,6 @@ public:
     const vector<int> &up,
     pg_shard_t up_primary,
     const map<pg_shard_t, pg_info_t> &all_info,
-    bool compat_mode,
     bool restrict_to_up_acting,
     vector<int> *want,
     set<pg_shard_t> *backfill,
@@ -1193,7 +1209,6 @@ public:
 
     // common to both scrubs
     bool active;
-    bool queue_snap_trim;
     int waiting_on;
     set<pg_shard_t> waiting_on_whom;
     int shallow_errors;
@@ -1295,7 +1310,6 @@ public:
     // clear all state
     void reset() {
       active = false;
-      queue_snap_trim = false;
       waiting_on = 0;
       waiting_on_whom.clear();
       if (active_rep_scrub) {
@@ -1347,9 +1361,11 @@ public:
    * return true if any inconsistency/missing is repaired, false otherwise
    */
   bool scrub_process_inconsistent();
+  bool ops_blocked_by_scrub() const;
   void scrub_finish();
   void scrub_clear_state();
   void _scan_snaps(ScrubMap &map);
+  void _repair_oinfo_oid(ScrubMap &map);
   void _scan_rollback_obs(
     const vector<ghobject_t> &rollback_obs,
     ThreadPool::TPHandle &handle);
@@ -1398,8 +1414,8 @@ public:
   void handle_scrub_reserve_release(OpRequestRef op);
 
   void reject_reservation();
-  void schedule_backfill_full_retry();
-  void schedule_recovery_full_retry();
+  void schedule_backfill_retry(float retry);
+  void schedule_recovery_retry(float retry);
 
   // -- recovery state --
 
@@ -1551,6 +1567,33 @@ public:
       *out << #T;						   \
     }								   \
   };
+  struct DeferBackfill : boost::statechart::event<DeferBackfill> {
+    float delay;
+    explicit DeferBackfill(float delay) : delay(delay) {}
+    void print(std::ostream *out) const {
+      *out << "DeferBackfill: delay " << delay;
+    }
+  };
+  struct DeferRecovery : boost::statechart::event<DeferRecovery> {
+    float delay;
+    explicit DeferRecovery(float delay) : delay(delay) {}
+    void print(std::ostream *out) const {
+      *out << "DeferRecovery: delay " << delay;
+    }
+  };
+  struct UnfoundBackfill : boost::statechart::event<UnfoundBackfill> {
+    explicit UnfoundBackfill() {}
+    void print(std::ostream *out) const {
+      *out << "UnfoundBackfill";
+    }
+  };
+  struct UnfoundRecovery : boost::statechart::event<UnfoundRecovery> {
+    explicit UnfoundRecovery() {}
+    void print(std::ostream *out) const {
+      *out << "UnfoundRecovery";
+    }
+  };
+protected:
   TrivialEvent(Initialize)
   TrivialEvent(Load)
   TrivialEvent(GotInfo)
@@ -1560,12 +1603,20 @@ public:
   TrivialEvent(Backfilled)
   TrivialEvent(LocalBackfillReserved)
   TrivialEvent(RemoteBackfillReserved)
+  TrivialEvent(RejectRemoteReservation)
   TrivialEvent(RemoteReservationRejected)
+  TrivialEvent(RemoteReservationCanceled)
   TrivialEvent(RequestBackfill)
   TrivialEvent(RequestRecovery)
   TrivialEvent(RecoveryDone)
   TrivialEvent(BackfillTooFull)
   TrivialEvent(RecoveryTooFull)
+
+  TrivialEvent(MakePrimary)
+  TrivialEvent(MakeStray)
+  TrivialEvent(NeedActingChange)
+  TrivialEvent(IsIncomplete)
+  TrivialEvent(IsDown)
 
   TrivialEvent(AllReplicasRecovered)
   TrivialEvent(DoRecovery)
@@ -1659,6 +1710,36 @@ public:
     friend class RecoveryMachine;
 
     /* States */
+    // Initial
+    // Reset
+    // Start
+    //   Started
+    //     Primary
+    //       WaitActingChange
+    //       Peering
+    //         GetInfo
+    //         GetLog
+    //         GetMissing
+    //         WaitUpThru
+    //         Incomplete
+    //       Active
+    //         Activating
+    //         Clean
+    //         Recovered
+    //         Backfilling
+    //         WaitRemoteBackfillReserved
+    //         WaitLocalBackfillReserved
+    //         NotBackfilling
+    //         NotRecovering
+    //         Recovering
+    //         WaitRemoteRecoveryReserved
+    //         WaitLocalRecoveryReserved
+    //     ReplicaActive
+    //       RepNotRecovering
+    //       RepRecovering
+    //       RepWaitBackfillReserved
+    //       RepWaitRecoveryReserved
+    //     Stray
 
     struct Crashed : boost::statechart::state< Crashed, RecoveryMachine >, NamedState {
       explicit Crashed(my_context ctx);
@@ -1732,12 +1813,6 @@ public:
       }
     };
 
-    struct MakePrimary : boost::statechart::event< MakePrimary > {
-      MakePrimary() : boost::statechart::event< MakePrimary >() {}
-    };
-    struct MakeStray : boost::statechart::event< MakeStray > {
-      MakeStray() : boost::statechart::event< MakeStray >() {}
-    };
     struct Primary;
     struct Stray;
 
@@ -1753,17 +1828,8 @@ public:
 
     struct Peering;
     struct WaitActingChange;
-    struct NeedActingChange : boost::statechart::event< NeedActingChange > {
-      NeedActingChange() : boost::statechart::event< NeedActingChange >() {}
-    };
     struct Incomplete;
-    struct IsIncomplete : boost::statechart::event< IsIncomplete > {
-      IsIncomplete() : boost::statechart::event< IsIncomplete >() {}
-    };
     struct Down;
-    struct IsDown : boost::statechart::event< IsDown > {
-      IsDown() : boost::statechart::event< IsDown >() {}
-    };
 
     struct Primary : boost::statechart::state< Primary, Started, Peering >, NamedState {
       explicit Primary(my_context ctx);
@@ -1833,7 +1899,12 @@ public:
 	boost::statechart::custom_reaction< MNotifyRec >,
 	boost::statechart::custom_reaction< MLogRec >,
 	boost::statechart::custom_reaction< Backfilled >,
-	boost::statechart::custom_reaction< AllReplicasActivated >
+	boost::statechart::custom_reaction< AllReplicasActivated >,
+	boost::statechart::custom_reaction< DeferRecovery >,
+	boost::statechart::custom_reaction< DeferBackfill >,
+  boost::statechart::custom_reaction< UnfoundRecovery >,
+	boost::statechart::custom_reaction< UnfoundBackfill >,
+	boost::statechart::custom_reaction< DoRecovery>
 	> reactions;
       boost::statechart::result react(const QueryState& q);
       boost::statechart::result react(const ActMap&);
@@ -1845,6 +1916,21 @@ public:
 	return discard_event();
       }
       boost::statechart::result react(const AllReplicasActivated&);
+      boost::statechart::result react(const DeferRecovery& evt) {
+	return discard_event();
+      }
+      boost::statechart::result react(const DeferBackfill& evt) {
+	return discard_event();
+      }
+      boost::statechart::result react(const UnfoundRecovery& evt) {
+  return discard_event();
+      }
+      boost::statechart::result react(const UnfoundBackfill& evt) {
+  return discard_event();
+      }
+      boost::statechart::result react(const DoRecovery&) {
+	return discard_event();
+      }
     };
 
     struct Clean : boost::statechart::state< Clean, Active >, NamedState {
@@ -1858,6 +1944,7 @@ public:
     struct Recovered : boost::statechart::state< Recovered, Active >, NamedState {
       typedef boost::mpl::list<
 	boost::statechart::transition< GoClean, Clean >,
+	boost::statechart::transition< DoRecovery, WaitLocalRecoveryReserved >,
 	boost::statechart::custom_reaction< AllReplicasActivated >
       > reactions;
       explicit Recovered(my_context ctx);
@@ -1871,10 +1958,14 @@ public:
     struct Backfilling : boost::statechart::state< Backfilling, Active >, NamedState {
       typedef boost::mpl::list<
 	boost::statechart::transition< Backfilled, Recovered >,
+	boost::statechart::custom_reaction< DeferBackfill >,
+	boost::statechart::custom_reaction< UnfoundBackfill >,
 	boost::statechart::custom_reaction< RemoteReservationRejected >
 	> reactions;
       explicit Backfilling(my_context ctx);
       boost::statechart::result react(const RemoteReservationRejected& evt);
+      boost::statechart::result react(const DeferBackfill& evt);
+      boost::statechart::result react(const UnfoundBackfill& evt);
       void exit();
     };
 
@@ -1913,9 +2004,19 @@ public:
 
     struct NotRecovering : boost::statechart::state< NotRecovering, Active>, NamedState {
       typedef boost::mpl::list<
-	boost::statechart::transition< DoRecovery, WaitLocalRecoveryReserved >
+	boost::statechart::transition< DoRecovery, WaitLocalRecoveryReserved >,
+	boost::statechart::custom_reaction< DeferRecovery >,
+	boost::statechart::custom_reaction< UnfoundRecovery >
 	> reactions;
       explicit NotRecovering(my_context ctx);
+      boost::statechart::result react(const DeferRecovery& evt) {
+	/* no-op */
+	return discard_event();
+      }
+      boost::statechart::result react(const UnfoundRecovery& evt) {
+	/* no-op */
+	return discard_event();
+      }
       void exit();
     };
 
@@ -1930,7 +2031,11 @@ public:
 	boost::statechart::custom_reaction< MQuery >,
 	boost::statechart::custom_reaction< MInfoRec >,
 	boost::statechart::custom_reaction< MLogRec >,
-	boost::statechart::custom_reaction< Activate >
+	boost::statechart::custom_reaction< Activate >,
+	boost::statechart::custom_reaction< DeferRecovery >,
+	boost::statechart::custom_reaction< DeferBackfill >,
+	boost::statechart::custom_reaction< UnfoundRecovery >,
+	boost::statechart::custom_reaction< UnfoundBackfill >
 	> reactions;
       boost::statechart::result react(const QueryState& q);
       boost::statechart::result react(const MInfoRec& infoevt);
@@ -1938,12 +2043,26 @@ public:
       boost::statechart::result react(const ActMap&);
       boost::statechart::result react(const MQuery&);
       boost::statechart::result react(const Activate&);
+      boost::statechart::result react(const DeferRecovery& evt) {
+	return discard_event();
+      }
+      boost::statechart::result react(const DeferBackfill& evt) {
+	return discard_event();
+      }
+      boost::statechart::result react(const UnfoundRecovery& evt) {
+	return discard_event();
+      }
+      boost::statechart::result react(const UnfoundBackfill& evt) {
+	return discard_event();
+      }
     };
 
     struct RepRecovering : boost::statechart::state< RepRecovering, ReplicaActive >, NamedState {
       typedef boost::mpl::list<
 	boost::statechart::transition< RecoveryDone, RepNotRecovering >,
+	// for compat with old peers
 	boost::statechart::transition< RemoteReservationRejected, RepNotRecovering >,
+	boost::statechart::transition< RemoteReservationCanceled, RepNotRecovering >,
 	boost::statechart::custom_reaction< BackfillTooFull >
 	> reactions;
       explicit RepRecovering(my_context ctx);
@@ -1954,43 +2073,64 @@ public:
     struct RepWaitBackfillReserved : boost::statechart::state< RepWaitBackfillReserved, ReplicaActive >, NamedState {
       typedef boost::mpl::list<
 	boost::statechart::custom_reaction< RemoteBackfillReserved >,
-	boost::statechart::custom_reaction< RemoteReservationRejected >
+	boost::statechart::custom_reaction< RejectRemoteReservation >,
+	boost::statechart::custom_reaction< RemoteReservationRejected >,
+	boost::statechart::custom_reaction< RemoteReservationCanceled >
 	> reactions;
       explicit RepWaitBackfillReserved(my_context ctx);
       void exit();
       boost::statechart::result react(const RemoteBackfillReserved &evt);
+      boost::statechart::result react(const RejectRemoteReservation &evt);
       boost::statechart::result react(const RemoteReservationRejected &evt);
+      boost::statechart::result react(const RemoteReservationCanceled &evt);
     };
 
     struct RepWaitRecoveryReserved : boost::statechart::state< RepWaitRecoveryReserved, ReplicaActive >, NamedState {
       typedef boost::mpl::list<
-	boost::statechart::custom_reaction< RemoteRecoveryReserved >
+	boost::statechart::custom_reaction< RemoteRecoveryReserved >,
+	// for compat with old peers
+	boost::statechart::custom_reaction< RemoteReservationRejected >,
+	boost::statechart::custom_reaction< RemoteReservationCanceled >
 	> reactions;
       explicit RepWaitRecoveryReserved(my_context ctx);
       void exit();
       boost::statechart::result react(const RemoteRecoveryReserved &evt);
+      boost::statechart::result react(const RemoteReservationRejected &evt) {
+	// for compat with old peers
+	post_event(RemoteReservationCanceled());
+	return discard_event();
+      }
+      boost::statechart::result react(const RemoteReservationCanceled &evt);
     };
 
     struct RepNotRecovering : boost::statechart::state< RepNotRecovering, ReplicaActive>, NamedState {
       typedef boost::mpl::list<
 	boost::statechart::custom_reaction< RequestBackfillPrio >,
         boost::statechart::transition< RequestRecovery, RepWaitRecoveryReserved >,
+	boost::statechart::custom_reaction< RejectRemoteReservation >,
+	boost::statechart::transition< RemoteReservationRejected, RepNotRecovering >,
+	boost::statechart::transition< RemoteReservationCanceled, RepNotRecovering >,
 	boost::statechart::transition< RecoveryDone, RepNotRecovering >  // for compat with pre-reservation peers
 	> reactions;
       explicit RepNotRecovering(my_context ctx);
       boost::statechart::result react(const RequestBackfillPrio &evt);
+      boost::statechart::result react(const RejectRemoteReservation &evt);
       void exit();
     };
 
     struct Recovering : boost::statechart::state< Recovering, Active >, NamedState {
       typedef boost::mpl::list <
 	boost::statechart::custom_reaction< AllReplicasRecovered >,
+	boost::statechart::custom_reaction< DeferRecovery >,
+	boost::statechart::custom_reaction< UnfoundRecovery >,
 	boost::statechart::custom_reaction< RequestBackfill >
 	> reactions;
       explicit Recovering(my_context ctx);
       void exit();
-      void release_reservations();
+      void release_reservations(bool cancel = false);
       boost::statechart::result react(const AllReplicasRecovered &evt);
+      boost::statechart::result react(const DeferRecovery& evt);
+      boost::statechart::result react(const UnfoundRecovery& evt);
       boost::statechart::result react(const RequestBackfill &evt);
     };
 
@@ -2199,9 +2339,6 @@ public:
 
   epoch_t last_epoch;
 
-  Mutex scrub_sleep_lock;
-  SafeTimer scrub_sleep_timer;
-
  public:
   const spg_t&      get_pgid() const { return pg_id; }
 
@@ -2213,6 +2350,9 @@ public:
 
   uint64_t get_min_acting_features() const { return acting_features; }
   uint64_t get_min_upacting_features() const { return upacting_features; }
+  bool perform_deletes_during_peering() const {
+    return !(get_osdmap()->test_flag(CEPH_OSDMAP_RECOVERY_DELETES));
+  }
 
   void init_primary_up_acting(
     const vector<int> &newup,
@@ -2282,12 +2422,15 @@ public:
   bool       is_activating() const { return state_test(PG_STATE_ACTIVATING); }
   bool       is_peering() const { return state_test(PG_STATE_PEERING); }
   bool       is_down() const { return state_test(PG_STATE_DOWN); }
+  bool       is_recovery_unfound() const { return state_test(PG_STATE_RECOVERY_UNFOUND); }
+  bool       is_backfill_unfound() const { return state_test(PG_STATE_BACKFILL_UNFOUND); }
   bool       is_incomplete() const { return state_test(PG_STATE_INCOMPLETE); }
   bool       is_clean() const { return state_test(PG_STATE_CLEAN); }
   bool       is_degraded() const { return state_test(PG_STATE_DEGRADED); }
   bool       is_undersized() const { return state_test(PG_STATE_UNDERSIZED); }
 
   bool       is_scrubbing() const { return state_test(PG_STATE_SCRUBBING); }
+  bool       is_remapped() const { return state_test(PG_STATE_REMAPPED); }
   bool       is_peered() const {
     return state_test(PG_STATE_ACTIVE) || state_test(PG_STATE_PEERED);
   }
@@ -2378,8 +2521,8 @@ public:
 
   virtual void kick_snap_trim() = 0;
   virtual void snap_trimmer_scrub_complete() = 0;
-  bool requeue_scrub();
-  void queue_recovery(bool front = false);
+  bool requeue_scrub(bool high_priority = false);
+  void queue_recovery();
   bool queue_scrub();
   unsigned get_scrub_priority();
 
@@ -2388,7 +2531,7 @@ public:
 
 
   bool append_log_entries_update_missing(
-    const mempool::osd::list<pg_log_entry_t> &entries,
+    const mempool::osd_pglog::list<pg_log_entry_t> &entries,
     ObjectStore::Transaction &t);
 
   /**
@@ -2396,7 +2539,7 @@ public:
    * actingbackfill logs and missings (also missing_loc)
    */
   void merge_new_log_entries(
-    const mempool::osd::list<pg_log_entry_t> &entries,
+    const mempool::osd_pglog::list<pg_log_entry_t> &entries,
     ObjectStore::Transaction &t);
 
   void reset_interval_flush();

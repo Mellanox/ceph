@@ -20,16 +20,18 @@
 #include <pthread.h>
 #include <string>
 #include <include/assert.h>
+#include "acconfig.h"
 #include "lockdep.h"
-#include "include/atomic.h"
 #include "common/valgrind.h"
+
+#include <atomic>
 
 class RWLock final
 {
   mutable pthread_rwlock_t L;
   std::string name;
   mutable int id;
-  mutable atomic_t nrlock, nwlock;
+  mutable std::atomic<unsigned> nrlock = { 0 }, nwlock = { 0 };
   bool track, lockdep;
 
   std::string unique_name(const char* name) const;
@@ -39,9 +41,9 @@ public:
   const RWLock& operator=(const RWLock& other) = delete;
 
   RWLock(const std::string &n, bool track_lock=true, bool ld=true, bool prioritize_write=false)
-    : name(n), id(-1), nrlock(0), nwlock(0), track(track_lock),
+    : name(n), id(-1), track(track_lock),
       lockdep(ld) {
-#if defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
+#if defined(HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP)
     if (prioritize_write) {
       pthread_rwlockattr_t attr;
       pthread_rwlockattr_init(&attr);
@@ -65,12 +67,12 @@ public:
 
   bool is_locked() const {
     assert(track);
-    return (nrlock.read() > 0) || (nwlock.read() > 0);
+    return (nrlock > 0) || (nwlock > 0);
   }
 
   bool is_wlocked() const {
     assert(track);
-    return (nwlock.read() > 0);
+    return (nwlock > 0);
   }
   ~RWLock() {
     // The following check is racy but we are about to destroy
@@ -85,11 +87,11 @@ public:
 
   void unlock(bool lockdep=true) const {
     if (track) {
-      if (nwlock.read() > 0) {
-        nwlock.dec();
+      if (nwlock > 0) {
+        nwlock--;
       } else {
-        assert(nrlock.read() > 0);
-        nrlock.dec();
+        assert(nrlock > 0);
+        nrlock--;
       }
     }
     if (lockdep && this->lockdep && g_lockdep)
@@ -105,12 +107,12 @@ public:
     assert(r == 0);
     if (lockdep && g_lockdep) id = lockdep_locked(name.c_str(), id);
     if (track)
-      nrlock.inc();
+      nrlock++;
   }
   bool try_get_read() const {
     if (pthread_rwlock_tryrdlock(&L) == 0) {
       if (track)
-         nrlock.inc();
+         nrlock++;
       if (lockdep && g_lockdep) id = lockdep_locked(name.c_str(), id);
       return true;
     }
@@ -129,7 +131,7 @@ public:
     if (lockdep && this->lockdep && g_lockdep)
       id = lockdep_locked(name.c_str(), id);
     if (track)
-      nwlock.inc();
+      nwlock++;
 
   }
   bool try_get_write(bool lockdep=true) {
@@ -137,7 +139,7 @@ public:
       if (lockdep && this->lockdep && g_lockdep)
 	id = lockdep_locked(name.c_str(), id);
       if (track)
-         nwlock.inc();
+         nwlock++;
       return true;
     }
     return false;

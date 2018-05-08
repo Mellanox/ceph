@@ -25,17 +25,11 @@
  * parameters as the client sees them - it would be silly to mention
  * in each one that they take an input and an output bufferlist.
  */
-#include "include/int_types.h"
 #include "include/types.h"
 
 #include <algorithm>
-#include <cstring>
-#include <cstdlib>
 #include <errno.h>
-#include <iostream>
-#include <map>
 #include <sstream>
-#include <vector>
 
 #include "common/bit_vector.hpp"
 #include "common/errno.h"
@@ -229,12 +223,15 @@ int create(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   bufferlist featuresbl;
   bufferlist object_prefixbl;
   bufferlist snap_seqbl;
+  bufferlist create_timestampbl;
   uint64_t snap_seq = 0;
+  utime_t create_timestamp = ceph_clock_now();
   ::encode(size, sizebl);
   ::encode(order, orderbl);
   ::encode(features, featuresbl);
   ::encode(object_prefix, object_prefixbl);
   ::encode(snap_seq, snap_seqbl);
+  ::encode(create_timestamp, create_timestampbl);
 
   map<string, bufferlist> omap_vals;
   omap_vals["size"] = sizebl;
@@ -242,6 +239,7 @@ int create(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   omap_vals["features"] = featuresbl;
   omap_vals["object_prefix"] = object_prefixbl;
   omap_vals["snap_seq"] = snap_seqbl;
+  omap_vals["create_timestamp"] = create_timestampbl;
 
   if (features & RBD_FEATURE_DATA_POOL) {
     if (data_pool_id == -1) {
@@ -775,6 +773,32 @@ int set_stripe_unit_count(cls_method_context_t hctx, bufferlist *in, bufferlist 
   return 0;
 }
 
+int get_create_timestamp(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
+{
+  CLS_LOG(20, "get_create_timestamp");
+
+  utime_t timestamp;
+  bufferlist bl;
+  int r = cls_cxx_map_get_val(hctx, "create_timestamp", &bl);
+  if (r < 0) {
+    if (r != -ENOENT) {
+      CLS_ERR("error reading create_timestamp: %s", cpp_strerror(r).c_str());
+      return r;
+    }
+  } else {
+    try {
+      bufferlist::iterator it = bl.begin();
+      ::decode(timestamp, it);
+    } catch (const buffer::error &err) {
+      CLS_ERR("could not decode create_timestamp");
+      return -EIO;
+    }
+  }
+
+  ::encode(timestamp, *out);
+  return 0;
+}
+
 /**
  * get the image flags
  *
@@ -1063,10 +1087,11 @@ int remove_parent(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
     int max_read = RBD_MAX_KEYS_READ;
     vector<snapid_t> snap_ids;
     string last_read = RBD_SNAP_KEY_PREFIX;
+    bool more;
 
     do {
       set<string> keys;
-      r = cls_cxx_map_get_keys(hctx, last_read, max_read, &keys);
+      r = cls_cxx_map_get_keys(hctx, last_read, max_read, &keys, &more);
       if (r < 0) {
         return r;
       }
@@ -1101,7 +1126,7 @@ int remove_parent(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
       if (!keys.empty()) {
         last_read = *(keys.rbegin());
       }
-    } while (r == max_read);
+    } while (more);
   }
 
   cls_rbd_parent parent;
@@ -1346,10 +1371,11 @@ int get_snapcontext(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   int max_read = RBD_MAX_KEYS_READ;
   vector<snapid_t> snap_ids;
   string last_read = RBD_SNAP_KEY_PREFIX;
+  bool more;
 
   do {
     set<string> keys;
-    r = cls_cxx_map_get_keys(hctx, last_read, max_read, &keys);
+    r = cls_cxx_map_get_keys(hctx, last_read, max_read, &keys, &more);
     if (r < 0)
       return r;
 
@@ -1362,7 +1388,7 @@ int get_snapcontext(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
     }
     if (!keys.empty())
       last_read = *(keys.rbegin());
-  } while (r == max_read);
+  } while (more);
 
   uint64_t snap_seq;
   r = read_key(hctx, "snap_seq", &snap_seq);
@@ -1607,10 +1633,11 @@ int snapshot_add(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   int max_read = RBD_MAX_KEYS_READ;
   uint64_t total_read = 0;
   string last_read = RBD_SNAP_KEY_PREFIX;
+  bool more;
   do {
     map<string, bufferlist> vals;
     r = cls_cxx_map_get_vals(hctx, last_read, RBD_SNAP_KEY_PREFIX,
-			     max_read, &vals);
+			     max_read, &vals, &more);
     if (r < 0)
       return r;
 
@@ -1644,7 +1671,7 @@ int snapshot_add(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 
     if (!vals.empty())
       last_read = vals.rbegin()->first;
-  } while (r == RBD_MAX_KEYS_READ);
+  } while (more);
 
   // snapshot inherits parent, if any
   cls_rbd_parent parent;
@@ -1705,10 +1732,11 @@ int snapshot_rename(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 
   int max_read = RBD_MAX_KEYS_READ;
   string last_read = RBD_SNAP_KEY_PREFIX;
+  bool more;
   do {
     map<string, bufferlist> vals;
     r = cls_cxx_map_get_vals(hctx, last_read, RBD_SNAP_KEY_PREFIX,
-			     max_read, &vals);
+			     max_read, &vals, &more);
     if (r < 0)
       return r;
 
@@ -1730,7 +1758,7 @@ int snapshot_rename(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
     }
     if (!vals.empty())
       last_read = vals.rbegin()->first;
-  } while (r == RBD_MAX_KEYS_READ);
+  } while (more);
 
   key_from_snap_id(src_snap_id, &src_snap_key);
   r = read_key(hctx, src_snap_key, &snap_meta); 
@@ -2140,15 +2168,15 @@ int dir_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   }
 
   int max_read = RBD_MAX_KEYS_READ;
-  int r = max_read;
   map<string, string> images;
   string last_read = dir_key_for_name(start_after);
+  bool more = true;
 
-  while (r == max_read && images.size() < max_return) {
+  while (more && images.size() < max_return) {
     map<string, bufferlist> vals;
     CLS_LOG(20, "last_read = '%s'", last_read.c_str());
-    r = cls_cxx_map_get_vals(hctx, last_read, RBD_DIR_NAME_KEY_PREFIX,
-			     max_read, &vals);
+    int r = cls_cxx_map_get_vals(hctx, last_read, RBD_DIR_NAME_KEY_PREFIX,
+                                 max_read, &vals, &more);
     if (r < 0) {
       CLS_ERR("error reading directory by name: %s", cpp_strerror(r).c_str());
       return r;
@@ -2432,7 +2460,7 @@ int object_map_update(cls_method_context_t hctx, bufferlist *in, bufferlist *out
     CLS_ERR("object map footer read failed");
     return r;
   }
- 
+
   try {
     bufferlist::iterator it = footer_bl.begin();
     object_map.decode_footer(it);
@@ -2468,13 +2496,14 @@ int object_map_update(cls_method_context_t hctx, bufferlist *in, bufferlist *out
   }
 
   bool updated = false;
-  for (uint64_t object_no = start_object_no; object_no < end_object_no;
-       ++object_no) {
-    uint8_t state = object_map[object_no];
+  auto it = object_map.begin() + start_object_no;
+  auto end_it = object_map.begin() + end_object_no;
+  for (; it != end_it; ++it) {
+    uint8_t state = *it;
     if ((!current_object_state || state == *current_object_state ||
         (*current_object_state == OBJECT_EXISTS &&
          state == OBJECT_EXISTS_CLEAN)) && state != new_object_state) {
-      object_map[object_no] = new_object_state;
+      *it = new_object_state;
       updated = true;
     }
   }
@@ -2529,9 +2558,11 @@ int object_map_snap_add(cls_method_context_t hctx, bufferlist *in,
   }
 
   bool updated = false;
-  for (uint64_t i = 0; i < object_map.size(); ++i) {
-    if (object_map[i] == OBJECT_EXISTS) {
-      object_map[i] = OBJECT_EXISTS_CLEAN;
+  auto it = object_map.begin();
+  auto end_it = object_map.end();
+  for (; it != end_it; ++it) {
+    if (*it == OBJECT_EXISTS) {
+      *it = OBJECT_EXISTS_CLEAN;
       updated = true;
     }
   }
@@ -2572,12 +2603,19 @@ int object_map_snap_remove(cls_method_context_t hctx, bufferlist *in,
   }
 
   bool updated = false;
-  for (uint64_t i = 0; i < dst_object_map.size(); ++i) {
-    if (dst_object_map[i] == OBJECT_EXISTS_CLEAN &&
-        (i >= src_object_map.size() || src_object_map[i] == OBJECT_EXISTS)) {
-      dst_object_map[i] = OBJECT_EXISTS;
+  auto src_it = src_object_map.begin();
+  auto dst_it = dst_object_map.begin();
+  auto dst_it_end = dst_object_map.end();
+  uint64_t i = 0;
+  for (; dst_it != dst_it_end; ++dst_it) {
+    if (*dst_it == OBJECT_EXISTS_CLEAN &&
+        (i >= src_object_map.size() || *src_it == OBJECT_EXISTS)) {
+      *dst_it = OBJECT_EXISTS;
       updated = true;
     }
+    if (i < src_object_map.size())
+      ++src_it;
+    ++i;
   }
 
   if (updated) {
@@ -2602,7 +2640,7 @@ static const string metadata_name_from_key(const string &key)
  * Input:
  * @param start_after which name to begin listing after
  *        (use the empty string to start at the beginning)
- * @param max_return the maximum number of names to list(if 0 means no limit)
+ * @param max_return the maximum number of names to list
 
  * Output:
  * @param value
@@ -2621,32 +2659,33 @@ int metadata_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
     return -EINVAL;
   }
 
+  // TODO remove implicit support for zero during the N-release
+  if (max_return == 0) {
+    max_return = RBD_MAX_KEYS_READ;
+  }
+
   map<string, bufferlist> data;
   string last_read = metadata_key_for_name(start_after);
-  int max_read = max_return ? MIN(RBD_MAX_KEYS_READ, max_return) : RBD_MAX_KEYS_READ;
+  bool more = true;
 
-  do {
+  while (more && data.size() < max_return) {
     map<string, bufferlist> raw_data;
+    int max_read = MIN(RBD_MAX_KEYS_READ, max_return - data.size());
     int r = cls_cxx_map_get_vals(hctx, last_read, RBD_METADATA_KEY_PREFIX,
-                             max_read, &raw_data);
+                                 max_read, &raw_data, &more);
     if (r < 0) {
       CLS_ERR("failed to read the vals off of disk: %s", cpp_strerror(r).c_str());
       return r;
     }
-    if (raw_data.empty())
-      break;
 
-    map<string, bufferlist>::iterator it = raw_data.begin();
-    for (; it != raw_data.end(); ++it)
-      data[metadata_name_from_key(it->first)].swap(it->second);
+    for (auto& kv : raw_data) {
+      data[metadata_name_from_key(kv.first)].swap(kv.second);
+    }
 
-    if (r < max_read)
-      break;
-
-    last_read = raw_data.rbegin()->first;
-    if (max_return)
-      max_read = MIN(RBD_MAX_KEYS_READ, max_return - data.size());
-  } while (max_read);
+    if (!raw_data.empty()) {
+      last_read = raw_data.rbegin()->first;
+    }
+  }
 
   ::encode(data, *out);
   return 0;
@@ -3138,15 +3177,31 @@ int uuid_get(cls_method_context_t hctx, std::string *mirror_uuid) {
   return 0;
 }
 
+int list_watchers(cls_method_context_t hctx,
+                  std::set<entity_inst_t> *entities) {
+  obj_list_watch_response_t watchers;
+  int r = cls_cxx_list_watchers(hctx, &watchers);
+  if (r < 0 && r != -ENOENT) {
+    CLS_ERR("error listing watchers: '%s'", cpp_strerror(r).c_str());
+    return r;
+  }
+
+  entities->clear();
+  for (auto &w : watchers.entries) {
+    entities->emplace(w.name, w.addr);
+  }
+  return 0;
+}
+
 int read_peers(cls_method_context_t hctx,
                std::vector<cls::rbd::MirrorPeer> *peers) {
   std::string last_read = PEER_KEY_PREFIX;
   int max_read = RBD_MAX_KEYS_READ;
-  int r = max_read;
-  while (r == max_read) {
+  bool more = true;
+  while (more) {
     std::map<std::string, bufferlist> vals;
-    r = cls_cxx_map_get_vals(hctx, last_read, PEER_KEY_PREFIX.c_str(),
-			     max_read, &vals);
+    int r = cls_cxx_map_get_vals(hctx, last_read, PEER_KEY_PREFIX.c_str(),
+                                 max_read, &vals, &more);
     if (r < 0) {
       CLS_ERR("error reading peers: %s", cpp_strerror(r).c_str());
       return r;
@@ -3390,6 +3445,7 @@ int image_status_remove(cls_method_context_t hctx,
 }
 
 int image_status_get(cls_method_context_t hctx, const string &global_image_id,
+                     const std::set<entity_inst_t> &watchers,
 		     cls::rbd::MirrorImageStatus *status) {
 
   bufferlist bl;
@@ -3412,23 +3468,9 @@ int image_status_get(cls_method_context_t hctx, const string &global_image_id,
     return -EIO;
   }
 
-  obj_list_watch_response_t watchers;
-  r = cls_cxx_list_watchers(hctx, &watchers);
-  if (r < 0 && r != -ENOENT) {
-    CLS_ERR("error listing watchers: '%s'", cpp_strerror(r).c_str());
-    return r;
-  }
 
   *status = static_cast<cls::rbd::MirrorImageStatus>(ondisk_status);
-  status->up = false;
-  for (auto &w : watchers.entries) {
-    if (w.name == ondisk_status.origin.name &&
-	w.addr == ondisk_status.origin.addr) {
-      status->up = true;
-      break;
-    }
-  }
-
+  status->up = (watchers.find(ondisk_status.origin) != watchers.end());
   return 0;
 }
 
@@ -3438,13 +3480,19 @@ int image_status_list(cls_method_context_t hctx,
         map<std::string, cls::rbd::MirrorImageStatus> *mirror_statuses) {
   std::string last_read = image_key(start_after);
   int max_read = RBD_MAX_KEYS_READ;
-  int r = max_read;
+  bool more = true;
 
-  while (r == max_read && mirror_images->size() < max_return) {
+  std::set<entity_inst_t> watchers;
+  int r = list_watchers(hctx, &watchers);
+  if (r < 0) {
+    return r;
+  }
+
+  while (more && mirror_images->size() < max_return) {
     std::map<std::string, bufferlist> vals;
     CLS_LOG(20, "last_read = '%s'", last_read.c_str());
-    r = cls_cxx_map_get_vals(hctx, last_read, IMAGE_KEY_PREFIX, max_read,
-			     &vals);
+    r = cls_cxx_map_get_vals(hctx, last_read, IMAGE_KEY_PREFIX, max_read, &vals,
+                             &more);
     if (r < 0) {
       CLS_ERR("error reading mirror image directory by name: %s",
               cpp_strerror(r).c_str());
@@ -3467,7 +3515,8 @@ int image_status_list(cls_method_context_t hctx,
       (*mirror_images)[image_id] = mirror_image;
 
       cls::rbd::MirrorImageStatus status;
-      int r1 = image_status_get(hctx, mirror_image.global_image_id, &status);
+      int r1 = image_status_get(hctx, mirror_image.global_image_id, watchers,
+                                &status);
       if (r1 < 0) {
 	continue;
       }
@@ -3484,29 +3533,21 @@ int image_status_list(cls_method_context_t hctx,
 
 int image_status_get_summary(cls_method_context_t hctx,
 	std::map<cls::rbd::MirrorImageStatusState, int> *states) {
-  obj_list_watch_response_t watchers_;
-  int r = cls_cxx_list_watchers(hctx, &watchers_);
+  std::set<entity_inst_t> watchers;
+  int r = list_watchers(hctx, &watchers);
   if (r < 0) {
-    if (r != -ENOENT) {
-      CLS_ERR("error listing watchers: '%s'", cpp_strerror(r).c_str());
-    }
     return r;
-  }
-
-  set<entity_inst_t> watchers;
-  for (auto &w : watchers_.entries) {
-    watchers.insert(entity_inst_t(w.name, w.addr));
   }
 
   states->clear();
 
   string last_read = IMAGE_KEY_PREFIX;
   int max_read = RBD_MAX_KEYS_READ;
-  r = max_read;
-  while (r == max_read) {
+  bool more = true;
+  while (more) {
     map<string, bufferlist> vals;
     r = cls_cxx_map_get_vals(hctx, last_read, IMAGE_KEY_PREFIX,
-			     max_read, &vals);
+			     max_read, &vals, &more);
     if (r < 0) {
       CLS_ERR("error reading mirrored images: %s", cpp_strerror(r).c_str());
       return r;
@@ -3530,7 +3571,7 @@ int image_status_get_summary(cls_method_context_t hctx,
       }
 
       cls::rbd::MirrorImageStatus status;
-      image_status_get(hctx, mirror_image.global_image_id, &status);
+      image_status_get(hctx, mirror_image.global_image_id, watchers, &status);
 
       cls::rbd::MirrorImageStatusState state = status.up ? status.state :
 	cls::rbd::MIRROR_IMAGE_STATUS_STATE_UNKNOWN;
@@ -3546,27 +3587,19 @@ int image_status_get_summary(cls_method_context_t hctx,
 }
 
 int image_status_remove_down(cls_method_context_t hctx) {
-  obj_list_watch_response_t watchers_;
-  int r = cls_cxx_list_watchers(hctx, &watchers_);
+  std::set<entity_inst_t> watchers;
+  int r = list_watchers(hctx, &watchers);
   if (r < 0) {
-    if (r != -ENOENT) {
-      CLS_ERR("error listing watchers: '%s'", cpp_strerror(r).c_str());
-    }
     return r;
-  }
-
-  set<entity_inst_t> watchers;
-  for (auto &w : watchers_.entries) {
-    watchers.insert(entity_inst_t(w.name, w.addr));
   }
 
   string last_read = STATUS_GLOBAL_KEY_PREFIX;
   int max_read = RBD_MAX_KEYS_READ;
-  r = max_read;
-  while (r == max_read) {
+  bool more = true;
+  while (more) {
     map<string, bufferlist> vals;
     r = cls_cxx_map_get_vals(hctx, last_read, STATUS_GLOBAL_KEY_PREFIX,
-			     max_read, &vals);
+			     max_read, &vals, &more);
     if (r < 0) {
       CLS_ERR("error reading mirrored images: %s", cpp_strerror(r).c_str());
       return r;
@@ -3614,11 +3647,11 @@ int instances_list(cls_method_context_t hctx,
                    std::vector<std::string> *instance_ids) {
   std::string last_read = INSTANCE_KEY_PREFIX;
   int max_read = RBD_MAX_KEYS_READ;
-  int r = max_read;
-  while (r == max_read) {
+  bool more = true;
+  while (more) {
     std::map<std::string, bufferlist> vals;
-    r = cls_cxx_map_get_vals(hctx, last_read, INSTANCE_KEY_PREFIX.c_str(),
-                             max_read, &vals);
+    int r = cls_cxx_map_get_vals(hctx, last_read, INSTANCE_KEY_PREFIX.c_str(),
+                                 max_read, &vals, &more);
     if (r < 0) {
       if (r != -ENOENT) {
 	CLS_ERR("error reading mirror instances: %s", cpp_strerror(r).c_str());
@@ -4025,15 +4058,15 @@ int mirror_image_list(cls_method_context_t hctx, bufferlist *in,
   }
 
   int max_read = RBD_MAX_KEYS_READ;
-  int r = max_read;
+  bool more = true;
   std::map<std::string, std::string> mirror_images;
   std::string last_read = mirror::image_key(start_after);
 
-  while (r == max_read && mirror_images.size() < max_return) {
+  while (more && mirror_images.size() < max_return) {
     std::map<std::string, bufferlist> vals;
     CLS_LOG(20, "last_read = '%s'", last_read.c_str());
-    r = cls_cxx_map_get_vals(hctx, last_read, mirror::IMAGE_KEY_PREFIX,
-			     max_read, &vals);
+    int r = cls_cxx_map_get_vals(hctx, last_read, mirror::IMAGE_KEY_PREFIX,
+                                 max_read, &vals, &more);
     if (r < 0) {
       CLS_ERR("error reading mirror image directory by name: %s",
               cpp_strerror(r).c_str());
@@ -4246,8 +4279,14 @@ int mirror_image_status_get(cls_method_context_t hctx, bufferlist *in,
     return -EINVAL;
   }
 
+  std::set<entity_inst_t> watchers;
+  int r = mirror::list_watchers(hctx, &watchers);
+  if (r < 0) {
+    return r;
+  }
+
   cls::rbd::MirrorImageStatus status;
-  int r = mirror::image_status_get(hctx, global_image_id, &status);
+  r = mirror::image_status_get(hctx, global_image_id, watchers, &status);
   if (r < 0) {
     return r;
   }
@@ -4445,15 +4484,15 @@ int group_dir_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   }
 
   int max_read = RBD_MAX_KEYS_READ;
-  int r = max_read;
+  bool more = true;
   map<string, string> groups;
   string last_read = dir_key_for_name(start_after);
 
-  while (r == max_read && groups.size() < max_return) {
+  while (more && groups.size() < max_return) {
     map<string, bufferlist> vals;
     CLS_LOG(20, "last_read = '%s'", last_read.c_str());
-    r = cls_cxx_map_get_vals(hctx, last_read, RBD_DIR_NAME_KEY_PREFIX,
-			     max_read, &vals);
+    int r = cls_cxx_map_get_vals(hctx, last_read, RBD_DIR_NAME_KEY_PREFIX,
+                                 max_read, &vals, &more);
     if (r < 0) {
       CLS_ERR("error reading directory by name: %s", cpp_strerror(r).c_str());
       return r;
@@ -4699,12 +4738,12 @@ int group_image_list(cls_method_context_t hctx,
   std::map<string, bufferlist> vals;
   string last_read = start_after.image_key();
   std::vector<cls::rbd::GroupImageStatus> res;
-  int keys_read;
+  bool more;
   do {
-    keys_read = cls_cxx_map_get_vals(hctx, last_read,cls::rbd::RBD_GROUP_IMAGE_KEY_PREFIX,
-				     max_read, &vals);
-    if (keys_read < 0)
-      return keys_read;
+    int r = cls_cxx_map_get_vals(hctx, last_read,cls::rbd::RBD_GROUP_IMAGE_KEY_PREFIX,
+                                 max_read, &vals, &more);
+    if (r < 0)
+      return r;
 
     for (map<string, bufferlist>::iterator it = vals.begin();
 	 it != vals.end() && res.size() < max_return; ++it) {
@@ -4731,7 +4770,7 @@ int group_image_list(cls_method_context_t hctx,
       last_read = res.rbegin()->spec.image_key();
     }
 
-  } while ((keys_read == RBD_MAX_KEYS_READ) && (res.size() < max_return));
+  } while (more && (res.size() < max_return));
   ::encode(res, *out);
 
   return 0;
@@ -4992,6 +5031,11 @@ int trash_remove(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
  * Returns the list of trash spec entries registered in the rbd_trash
  * object.
  *
+ * Input:
+ * @param start_after which name to begin listing after
+ *        (use the empty string to start at the beginning)
+ * @param max_return the maximum number of names to list
+ *
  * Output:
  * @param data the map between image id and trash spec info
  *
@@ -4999,18 +5043,31 @@ int trash_remove(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
  */
 int trash_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  string start_after;
+  uint64_t max_return;
+
+  try {
+    bufferlist::iterator iter = in->begin();
+    ::decode(start_after, iter);
+    ::decode(max_return, iter);
+  } catch (const buffer::error &err) {
+    return -EINVAL;
+  }
+
   map<string, cls::rbd::TrashImageSpec> data;
-  string last_read = trash::image_key("");
-  int max_read = RBD_MAX_KEYS_READ;
+  string last_read = trash::image_key(start_after);
+  bool more = true;
 
   CLS_LOG(20, "trash_get_images");
-
-  do {
+  while (data.size() < max_return) {
     map<string, bufferlist> raw_data;
+    int max_read = std::min<int32_t>(RBD_MAX_KEYS_READ,
+                                     max_return - data.size());
     int r = cls_cxx_map_get_vals(hctx, last_read, trash::IMAGE_KEY_PREFIX,
-                                 max_read, &raw_data);
+                                 max_read, &raw_data, &more);
     if (r < 0) {
-      CLS_ERR("failed to read the vals off of disk: %s", cpp_strerror(r).c_str());
+      CLS_ERR("failed to read the vals off of disk: %s",
+              cpp_strerror(r).c_str());
       return r;
     }
     if (raw_data.empty()) {
@@ -5022,15 +5079,14 @@ int trash_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
       ::decode(data[trash::image_id_from_key(it->first)], it->second);
     }
 
-    if (r < max_read) {
+    if (!more) {
       break;
     }
 
     last_read = raw_data.rbegin()->first;
-  } while (max_read);
+  }
 
   ::encode(data, *out);
-
   return 0;
 }
 
@@ -5085,6 +5141,7 @@ CLS_INIT(rbd)
   cls_method_handle_t h_set_protection_status;
   cls_method_handle_t h_get_stripe_unit_count;
   cls_method_handle_t h_set_stripe_unit_count;
+  cls_method_handle_t h_get_create_timestamp;
   cls_method_handle_t h_get_flags;
   cls_method_handle_t h_set_flags;
   cls_method_handle_t h_remove_parent;
@@ -5233,6 +5290,9 @@ CLS_INIT(rbd)
   cls_register_cxx_method(h_class, "set_stripe_unit_count",
 			  CLS_METHOD_RD | CLS_METHOD_WR,
 			  set_stripe_unit_count, &h_set_stripe_unit_count);
+  cls_register_cxx_method(h_class, "get_create_timestamp",
+                          CLS_METHOD_RD,
+                          get_create_timestamp, &h_get_create_timestamp);
   cls_register_cxx_method(h_class, "get_flags",
                           CLS_METHOD_RD,
                           get_flags, &h_get_flags);

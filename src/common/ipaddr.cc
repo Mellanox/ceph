@@ -1,10 +1,15 @@
-#include "include/ipaddr.h"
 
-#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#endif
 
+#include "include/ipaddr.h"
 
 static void netmask_ipv4(const struct in_addr *addr,
 			 unsigned int prefix_len,
@@ -22,7 +27,7 @@ static void netmask_ipv4(const struct in_addr *addr,
 }
 
 
-const struct sockaddr *find_ipv4_in_subnet(const struct ifaddrs *addrs,
+const struct ifaddrs *find_ipv4_in_subnet(const struct ifaddrs *addrs,
 					   const struct sockaddr_in *net,
 					   unsigned int prefix_len) {
   struct in_addr want, temp;
@@ -44,7 +49,7 @@ const struct sockaddr *find_ipv4_in_subnet(const struct ifaddrs *addrs,
     netmask_ipv4(cur, prefix_len, &temp);
 
     if (temp.s_addr == want.s_addr) {
-      return addrs->ifa_addr;
+      return addrs;
     }
   }
 
@@ -66,7 +71,7 @@ static void netmask_ipv6(const struct in6_addr *addr,
 }
 
 
-const struct sockaddr *find_ipv6_in_subnet(const struct ifaddrs *addrs,
+const struct ifaddrs *find_ipv6_in_subnet(const struct ifaddrs *addrs,
 					   const struct sockaddr_in6 *net,
 					   unsigned int prefix_len) {
   struct in6_addr want, temp;
@@ -88,14 +93,14 @@ const struct sockaddr *find_ipv6_in_subnet(const struct ifaddrs *addrs,
     netmask_ipv6(cur, prefix_len, &temp);
 
     if (IN6_ARE_ADDR_EQUAL(&temp, &want))
-      return addrs->ifa_addr;
+      return addrs;
   }
 
   return NULL;
 }
 
 
-const struct sockaddr *find_ip_in_subnet(const struct ifaddrs *addrs,
+const struct ifaddrs *find_ip_in_subnet(const struct ifaddrs *addrs,
 					 const struct sockaddr *net,
 					 unsigned int prefix_len) {
   switch (net->sa_family) {

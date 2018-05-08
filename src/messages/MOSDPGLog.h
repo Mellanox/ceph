@@ -23,12 +23,12 @@ class MOSDPGLog : public Message {
   static const int HEAD_VERSION = 5;
   static const int COMPAT_VERSION = 2;
 
-  epoch_t epoch;
+  epoch_t epoch = 0;
   /// query_epoch is the epoch of the query being responded to, or
   /// the current epoch if this is not being sent in response to a
   /// query. This allows the recipient to disregard responses to old
   /// queries.
-  epoch_t query_epoch;
+  epoch_t query_epoch = 0;
 
 public:
   shard_id_t to;
@@ -82,6 +82,7 @@ public:
     ::encode(missing, payload);
     ::encode(query_epoch, payload);
     if (HAVE_FEATURE(features, SERVER_LUMINOUS)) {
+      header.version = HEAD_VERSION;
       ::encode(past_intervals, payload);
     } else {
       header.version = 4;

@@ -20,9 +20,12 @@
 
 #include <map>
 #include <deque>
-#include <boost/scoped_ptr.hpp>
+#include <atomic>
 #include <fstream>
+
 using namespace std;
+
+#include <boost/scoped_ptr.hpp>
 
 #include "include/unordered_map.h"
 
@@ -91,6 +94,7 @@ enum {
   l_filestore_bytes,
   l_filestore_apply_latency,
   l_filestore_queue_transaction_latency_avg,
+  l_filestore_sync_pause_max_lat,
   l_filestore_last,
 };
 
@@ -131,8 +135,8 @@ public:
 
     objectstore_perf_stat_t get_cur_stats() const {
       objectstore_perf_stat_t ret;
-      ret.os_commit_latency = os_commit_latency.avg();
-      ret.os_apply_latency = os_apply_latency.avg();
+      ret.os_commit_latency = os_commit_latency.current_avg();
+      ret.os_apply_latency = os_apply_latency.current_avg();
       return ret;
     }
 
@@ -364,7 +368,7 @@ private:
   FDCache fdcache;
   WBThrottle wbthrottle;
 
-  atomic_t next_osr_id;
+  std::atomic<int64_t> next_osr_id = { 0 };
   bool m_disable_wbthrottle;
   deque<OpSequencer*> op_queue;
   BackoffThrottle throttle_ops, throttle_bytes;
@@ -478,6 +482,10 @@ public:
   bool needs_journal() override {
     return false;
   }
+
+  bool is_rotational() override;
+  bool is_journal_rotational() override;
+
   void dump_perf_counters(Formatter *f) override {
     f->open_object_section("perf_counters");
     logger->dump_formatted(f, false);
@@ -580,8 +588,7 @@ public:
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags = 0,
-    bool allow_eio = false) override;
+    uint32_t op_flags = 0) override;
   int _do_fiemap(int fd, uint64_t offset, size_t len,
                  map<uint64_t, uint64_t> *m);
   int _do_seek_hole_data(int fd, uint64_t offset, size_t len,
@@ -634,6 +641,12 @@ public:
   set<ghobject_t> mdata_error_set; // getattr(),stat() will return -EIO
   void inject_data_error(const ghobject_t &oid) override;
   void inject_mdata_error(const ghobject_t &oid) override;
+
+  void compact() override {
+    assert(object_map);
+    object_map->compact();
+  }
+
   void debug_obj_on_delete(const ghobject_t &oid);
   bool debug_data_eio(const ghobject_t &oid);
   bool debug_mdata_eio(const ghobject_t &oid);
@@ -766,7 +779,7 @@ private:
   bool m_filestore_do_dump;
   std::ofstream m_filestore_dump;
   JSONFormatter m_filestore_dump_fmt;
-  atomic_t m_filestore_kill_at;
+  std::atomic<int64_t> m_filestore_kill_at = { 0 };
   bool m_filestore_sloppy_crc;
   int m_filestore_sloppy_crc_block_size;
   uint64_t m_filestore_max_alloc_hint_size;
@@ -825,6 +838,9 @@ protected:
   const string& get_basedir_path() {
     return filestore->basedir;
   }
+  const string& get_journal_path() {
+    return filestore->journalpath;
+  }
   const string& get_current_path() {
     return filestore->current_fn;
   }
@@ -861,6 +877,8 @@ public:
   virtual int syncfs() = 0;
   virtual bool has_fiemap() = 0;
   virtual bool has_seek_data_hole() = 0;
+  virtual bool is_rotational() = 0;
+  virtual bool is_journal_rotational() = 0;
   virtual int do_fiemap(int fd, off_t start, size_t len, struct fiemap **pfiemap) = 0;
   virtual int clone_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff) = 0;
   virtual int set_alloc_hint(int fd, uint64_t hint) = 0;

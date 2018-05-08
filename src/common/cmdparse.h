@@ -3,12 +3,11 @@
 #ifndef CEPH_COMMON_CMDPARSE_H
 #define CEPH_COMMON_CMDPARSE_H
 
-#include <string>
-#include <sstream>
-#include <map>
-#include <boost/variant.hpp>
 #include <vector>
 #include <stdexcept>
+#include <ostream>
+#include <boost/variant.hpp>
+#include "include/assert.h"	// boost clobbers this
 #include "common/Formatter.h"
 #include "common/BackTrace.h"
 
@@ -22,7 +21,8 @@ typedef boost::variant<std::string,
 		       int64_t,
 		       double,
 		       std::vector<std::string>,
-		       std::vector<int64_t>>  cmd_vartype;
+		       std::vector<int64_t>,
+		       std::vector<double>>  cmd_vartype;
 typedef std::map<std::string, cmd_vartype> cmdmap_t;
 
 std::string cmddesc_get_prefix(const std::string &cmddesc);
@@ -42,13 +42,13 @@ void dump_cmddesc_to_json(ceph::Formatter *jf,
 bool cmdmap_from_json(std::vector<std::string> cmd, cmdmap_t *mapp,
 		      std::stringstream &ss);
 void cmdmap_dump(const cmdmap_t &cmdmap, ceph::Formatter *f);
-void handle_bad_get(CephContext *cct, std::string k, const char *name);
+void handle_bad_get(CephContext *cct, const std::string& k, const char *name);
 
 std::string cmd_vartype_stringify(const cmd_vartype& v);
 
 template <typename T>
 bool
-cmd_getval(CephContext *cct, const cmdmap_t& cmdmap, std::string k, T& val)
+cmd_getval(CephContext *cct, const cmdmap_t& cmdmap, const std::string& k, T& val)
 {
   if (cmdmap.count(k)) {
     try {
@@ -65,7 +65,7 @@ cmd_getval(CephContext *cct, const cmdmap_t& cmdmap, std::string k, T& val)
 
 template <typename T>
 void
-cmd_getval(CephContext *cct, cmdmap_t& cmdmap, std::string k, T& val, T defval)
+cmd_getval(CephContext *cct, const cmdmap_t& cmdmap, const std::string& k, T& val, const T& defval)
 {
   if (!cmd_getval(cct, cmdmap, k, val))
     val = defval;
@@ -73,8 +73,12 @@ cmd_getval(CephContext *cct, cmdmap_t& cmdmap, std::string k, T& val, T defval)
 
 template <typename T>
 void
-cmd_putval(CephContext *cct, cmdmap_t& cmdmap, std::string k, T val)
+cmd_putval(CephContext *cct, cmdmap_t& cmdmap, const std::string& k, const T& val)
 {
   cmdmap[k] = val;
 }
+
+extern int parse_osd_id(const char *s, std::ostream *pss);
+extern long parse_pos_long(const char *s, std::ostream *pss = NULL);
+
 #endif

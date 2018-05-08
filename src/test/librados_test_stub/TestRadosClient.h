@@ -4,17 +4,19 @@
 #ifndef CEPH_TEST_RADOS_CLIENT_H
 #define CEPH_TEST_RADOS_CLIENT_H
 
-#include "include/rados/librados.hpp"
-#include "common/config.h"
-#include "include/atomic.h"
-#include "include/buffer_fwd.h"
-#include "test/librados_test_stub/TestWatchNotify.h"
-#include <boost/function.hpp>
-#include <boost/functional/hash.hpp>
-#include <list>
 #include <map>
+#include <list>
 #include <string>
 #include <vector>
+#include <atomic>
+
+#include <boost/function.hpp>
+#include <boost/functional/hash.hpp>
+
+#include "include/rados/librados.hpp"
+#include "common/config.h"
+#include "include/buffer_fwd.h"
+#include "test/librados_test_stub/TestWatchNotify.h"
 
 class Finisher;
 
@@ -76,6 +78,11 @@ public:
   virtual void object_list(int64_t pool_id,
 			   std::list<librados::TestRadosClient::Object> *list) = 0;
 
+  virtual int service_daemon_register(const std::string& service,
+                                      const std::string& name,
+                                      const std::map<std::string,std::string>& metadata) = 0;
+  virtual int service_daemon_update_status(const std::map<std::string,std::string>& status) = 0;
+
   virtual int pool_create(const std::string &pool_name) = 0;
   virtual int pool_delete(const std::string &pool_name) = 0;
   virtual int pool_get_base_tier(int64_t pool_id, int64_t* base_tier) = 0;
@@ -113,7 +120,7 @@ protected:
 private:
 
   CephContext *m_cct;
-  atomic_t m_refcount;
+  std::atomic<uint64_t> m_refcount = { 0 };
 
   TestWatchNotify *m_watch_notify;
 

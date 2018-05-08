@@ -58,6 +58,17 @@
                            reweight a given item (and adjust ancestor
                            weights as needed)
      -i mapfn --reweight   recalculate all bucket weights
+     -i mapfn --create-simple-rule name root type mode
+                           create crush rule <name> to start from <root>,
+                           replicate across buckets of type <type>, using
+                           a choose mode of <firstn|indep>
+     -i mapfn --create-replicated-rule name root type
+                           create crush rule <name> to start from <root>,
+                           replicate across buckets of type <type>
+     --device-class <class>
+                           use device class <class> for new rule
+     -i mapfn --remove-rule name
+                           remove the specified crush rule
   
   Options for the display/test stage
   
@@ -100,6 +111,7 @@
      [--outfn|-o outfile]
                            specify output for modified crush map
   
+ 
   $ crushtool --help-output
   data output from testing routine ...
              absolute_weights

@@ -20,9 +20,10 @@
 #include "rgw_cr_rados.h"
 #include "rgw_cr_rest.h"
 #include "rgw_http_client.h"
-#include "rgw_boost_asio_yield.h"
 
 #include "cls/lock/cls_lock_client.h"
+
+#include <boost/asio/yield.hpp>
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -413,7 +414,7 @@ class RGWReadMDLogEntriesCR : public RGWSimpleCoroutine {
   list<cls_log_entry> *entries;
   bool *truncated;
 
-  RGWAsyncReadMDLogEntries *req;
+  RGWAsyncReadMDLogEntries *req{nullptr};
 
 public:
   RGWReadMDLogEntriesCR(RGWMetaSyncEnv *_sync_env, RGWMetadataLog* mdlog,
@@ -592,8 +593,8 @@ class RGWInitSyncStatusCoroutine : public RGWCoroutine {
 
   rgw_meta_sync_info status;
   vector<RGWMetadataLogInfo> shards_info;
-  RGWContinuousLeaseCR *lease_cr;
-  RGWCoroutinesStack *lease_stack;
+  boost::intrusive_ptr<RGWContinuousLeaseCR> lease_cr;
+  boost::intrusive_ptr<RGWCoroutinesStack> lease_stack;
 public:
   RGWInitSyncStatusCoroutine(RGWMetaSyncEnv *_sync_env,
                              const rgw_meta_sync_info &status)
@@ -604,7 +605,6 @@ public:
   ~RGWInitSyncStatusCoroutine() override {
     if (lease_cr) {
       lease_cr->abort();
-      lease_cr->put();
     }
   }
 
@@ -616,11 +616,10 @@ public:
 	uint32_t lock_duration = cct->_conf->rgw_sync_lease_period;
         string lock_name = "sync_lock";
         RGWRados *store = sync_env->store;
-	lease_cr = new RGWContinuousLeaseCR(sync_env->async_rados, store,
-                                            rgw_raw_obj(store->get_zone_params().log_pool, sync_env->status_oid()),
-                                            lock_name, lock_duration, this);
-        lease_cr->get();
-        lease_stack = spawn(lease_cr, false);
+        lease_cr.reset(new RGWContinuousLeaseCR(sync_env->async_rados, store,
+                                                rgw_raw_obj(store->get_zone_params().log_pool, sync_env->status_oid()),
+                                                lock_name, lock_duration, this));
+        lease_stack.reset(spawn(lease_cr.get(), false));
       }
       while (!lease_cr->is_locked()) {
         if (lease_cr->is_done()) {
@@ -654,7 +653,7 @@ public:
 	}
       }
 
-      drain_all_but_stack(lease_stack); /* the lease cr still needs to run */
+      drain_all_but_stack(lease_stack.get()); /* the lease cr still needs to run */
 
       yield {
         set_status("updating sync status");
@@ -776,15 +775,30 @@ class RGWFetchAllMetaCR : public RGWCoroutine {
 
   list<string> sections;
   list<string>::iterator sections_iter;
-  list<string> result;
+
+  struct meta_list_result {
+    list<string> keys;
+    string marker;
+    uint64_t count{0};
+    bool truncated{false};
+
+    void decode_json(JSONObj *obj) {
+      JSONDecoder::decode_json("keys", keys, obj);
+      JSONDecoder::decode_json("marker", marker, obj);
+      JSONDecoder::decode_json("count", count, obj);
+      JSONDecoder::decode_json("truncated", truncated, obj);
+    }
+  } result;
   list<string>::iterator iter;
 
   std::unique_ptr<RGWShardedOmapCRManager> entries_index;
 
-  RGWContinuousLeaseCR *lease_cr;
-  RGWCoroutinesStack *lease_stack;
+  boost::intrusive_ptr<RGWContinuousLeaseCR> lease_cr;
+  boost::intrusive_ptr<RGWCoroutinesStack> lease_stack;
   bool lost_lock;
   bool failed;
+
+  string marker;
 
   map<uint32_t, rgw_meta_sync_marker>& markers;
 
@@ -797,9 +811,6 @@ public:
   }
 
   ~RGWFetchAllMetaCR() override {
-    if (lease_cr) {
-      lease_cr->put();
-    }
   }
 
   void append_section_from_set(set<string>& all_sections, const string& name) {
@@ -835,12 +846,11 @@ public:
         set_status(string("acquiring lock (") + sync_env->status_oid() + ")");
 	uint32_t lock_duration = cct->_conf->rgw_sync_lease_period;
         string lock_name = "sync_lock";
-	lease_cr = new RGWContinuousLeaseCR(sync_env->async_rados,
-                                            sync_env->store,
-                                            rgw_raw_obj(sync_env->store->get_zone_params().log_pool, sync_env->status_oid()),
-                                            lock_name, lock_duration, this);
-        lease_cr->get();
-        lease_stack = spawn(lease_cr, false);
+        lease_cr.reset(new RGWContinuousLeaseCR(sync_env->async_rados,
+                                                sync_env->store,
+                                                rgw_raw_obj(sync_env->store->get_zone_params().log_pool, sync_env->status_oid()),
+                                                lock_name, lock_duration, this));
+        lease_stack.reset(spawn(lease_cr.get(), false));
       }
       while (!lease_cr->is_locked()) {
         if (lease_cr->is_done()) {
@@ -868,41 +878,47 @@ public:
       rearrange_sections();
       sections_iter = sections.begin();
       for (; sections_iter != sections.end(); ++sections_iter) {
-        yield {
-	  string entrypoint = string("/admin/metadata/") + *sections_iter;
-          /* FIXME: need a better scaling solution here, requires streaming output */
-	  call(new RGWReadRESTResourceCR<list<string> >(cct, conn, sync_env->http_manager,
-				       entrypoint, NULL, &result));
-	}
-        if (get_ret_status() < 0) {
-          ldout(cct, 0) << "ERROR: failed to fetch metadata section: " << *sections_iter << dendl;
-          yield entries_index->finish();
-          yield lease_cr->go_down();
-          drain_all();
-          return set_cr_error(get_ret_status());
-        }
-        iter = result.begin();
-        for (; iter != result.end(); ++iter) {
-          if (!lease_cr->is_locked()) {
-            lost_lock = true;
-            break;
+        do {
+          yield {
+#define META_FULL_SYNC_CHUNK_SIZE "1000"
+            string entrypoint = string("/admin/metadata/") + *sections_iter;
+            rgw_http_param_pair pairs[] = { { "max-entries", META_FULL_SYNC_CHUNK_SIZE },
+              { "marker", result.marker.c_str() },
+              { NULL, NULL } };
+            result.keys.clear();
+            call(new RGWReadRESTResourceCR<meta_list_result >(cct, conn, sync_env->http_manager,
+                                                              entrypoint, pairs, &result));
           }
-          yield; // allow entries_index consumer to make progress
+          if (get_ret_status() < 0) {
+            ldout(cct, 0) << "ERROR: failed to fetch metadata section: " << *sections_iter << dendl;
+            yield entries_index->finish();
+            yield lease_cr->go_down();
+            drain_all();
+            return set_cr_error(get_ret_status());
+          }
+          iter = result.keys.begin();
+          for (; iter != result.keys.end(); ++iter) {
+            if (!lease_cr->is_locked()) {
+              lost_lock = true;
+              break;
+            }
+            yield; // allow entries_index consumer to make progress
 
-          ldout(cct, 20) << "list metadata: section=" << *sections_iter << " key=" << *iter << dendl;
-          string s = *sections_iter + ":" + *iter;
-          int shard_id;
-          RGWRados *store = sync_env->store;
-          int ret = store->meta_mgr->get_log_shard_id(*sections_iter, *iter, &shard_id);
-          if (ret < 0) {
-            ldout(cct, 0) << "ERROR: could not determine shard id for " << *sections_iter << ":" << *iter << dendl;
-            ret_status = ret;
-            break;
+            ldout(cct, 20) << "list metadata: section=" << *sections_iter << " key=" << *iter << dendl;
+            string s = *sections_iter + ":" + *iter;
+            int shard_id;
+            RGWRados *store = sync_env->store;
+            int ret = store->meta_mgr->get_log_shard_id(*sections_iter, *iter, &shard_id);
+            if (ret < 0) {
+              ldout(cct, 0) << "ERROR: could not determine shard id for " << *sections_iter << ":" << *iter << dendl;
+              ret_status = ret;
+              break;
+            }
+            if (!entries_index->append(s, shard_id)) {
+              break;
+            }
           }
-          if (!entries_index->append(s, shard_id)) {
-            break;
-          }
-	}
+        } while (result.truncated);
       }
       yield {
         if (!entries_index->finish()) {
@@ -920,7 +936,7 @@ public:
         }
       }
 
-      drain_all_but_stack(lease_stack); /* the lease cr still needs to run */
+      drain_all_but_stack(lease_stack.get()); /* the lease cr still needs to run */
 
       yield lease_cr->go_down();
 
@@ -1315,8 +1331,9 @@ class RGWMetaSyncShardCR : public RGWCoroutine {
   boost::asio::coroutine incremental_cr;
   boost::asio::coroutine full_cr;
 
-  RGWContinuousLeaseCR *lease_cr = nullptr;
-  RGWCoroutinesStack *lease_stack = nullptr;
+  boost::intrusive_ptr<RGWContinuousLeaseCR> lease_cr;
+  boost::intrusive_ptr<RGWCoroutinesStack> lease_stack;
+
   bool lost_lock = false;
 
   bool *reset_backoff;
@@ -1349,7 +1366,6 @@ public:
     delete marker_tracker;
     if (lease_cr) {
       lease_cr->abort();
-      lease_cr->put();
     }
   }
 
@@ -1425,7 +1441,7 @@ public:
         }
       }
 
-      ldout(sync_env->cct, 0) << *this << ": adjusting marker pos=" << sync_marker.marker << dendl;
+      ldout(sync_env->cct, 4) << *this << ": adjusting marker pos=" << sync_marker.marker << dendl;
       stack_to_pos.erase(iter);
     }
   }
@@ -1441,15 +1457,11 @@ public:
       yield {
 	uint32_t lock_duration = cct->_conf->rgw_sync_lease_period;
         string lock_name = "sync_lock";
-        if (lease_cr) {
-          lease_cr->put();
-        }
         RGWRados *store = sync_env->store;
-	lease_cr = new RGWContinuousLeaseCR(sync_env->async_rados, store,
-                                            rgw_raw_obj(pool, sync_env->shard_obj_name(shard_id)),
-                                            lock_name, lock_duration, this);
-        lease_cr->get();
-        lease_stack = spawn(lease_cr, false);
+        lease_cr.reset(new RGWContinuousLeaseCR(sync_env->async_rados, store,
+                                                rgw_raw_obj(pool, sync_env->shard_obj_name(shard_id)),
+                                                lock_name, lock_duration, this));
+        lease_stack.reset(spawn(lease_cr.get(), false));
         lost_lock = false;
       }
       while (!lease_cr->is_locked()) {
@@ -1523,7 +1535,7 @@ public:
 	  temp_marker->marker = std::move(temp_marker->next_step_marker);
 	  temp_marker->next_step_marker.clear();
 	  temp_marker->realm_epoch = realm_epoch;
-	  ldout(sync_env->cct, 0) << *this << ": saving marker pos=" << temp_marker->marker << " realm_epoch=" << realm_epoch << dendl;
+	  ldout(sync_env->cct, 4) << *this << ": saving marker pos=" << temp_marker->marker << " realm_epoch=" << realm_epoch << dendl;
 
 	  using WriteMarkerCR = RGWSimpleRadosWriteCR<rgw_meta_sync_marker>;
 	  yield call(new WriteMarkerCR(sync_env->async_rados, sync_env->store,
@@ -1533,6 +1545,8 @@ public:
 
         if (retcode < 0) {
           ldout(sync_env->cct, 0) << "ERROR: failed to set sync marker: retcode=" << retcode << dendl;
+          yield lease_cr->go_down();
+          drain_all();
           return retcode;
         }
       }
@@ -1544,8 +1558,7 @@ public:
 
       yield lease_cr->go_down();
 
-      lease_cr->put();
-      lease_cr = NULL;
+      lease_cr.reset();
 
       drain_all();
 
@@ -1577,11 +1590,10 @@ public:
           uint32_t lock_duration = cct->_conf->rgw_sync_lease_period;
           string lock_name = "sync_lock";
           RGWRados *store = sync_env->store;
-          lease_cr = new RGWContinuousLeaseCR(sync_env->async_rados, store,
-                                              rgw_raw_obj(pool, sync_env->shard_obj_name(shard_id)),
-                                              lock_name, lock_duration, this);
-          lease_cr->get();
-          lease_stack = spawn(lease_cr, false);
+          lease_cr.reset( new RGWContinuousLeaseCR(sync_env->async_rados, store,
+                                                   rgw_raw_obj(pool, sync_env->shard_obj_name(shard_id)),
+                                                   lock_name, lock_duration, this));
+          lease_stack.reset(spawn(lease_cr.get(), false));
           lost_lock = false;
         }
         while (!lease_cr->is_locked()) {
@@ -1596,7 +1608,7 @@ public:
       }
       // if the period has advanced, we can't use the existing marker
       if (sync_marker.realm_epoch < realm_epoch) {
-        ldout(sync_env->cct, 0) << "clearing marker=" << sync_marker.marker
+        ldout(sync_env->cct, 4) << "clearing marker=" << sync_marker.marker
             << " from old realm_epoch=" << sync_marker.realm_epoch
             << " (now " << realm_epoch << ')' << dendl;
         sync_marker.realm_epoch = realm_epoch;

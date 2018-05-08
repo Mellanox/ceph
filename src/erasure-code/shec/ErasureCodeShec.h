@@ -21,13 +21,8 @@
 #ifndef CEPH_ERASURE_CODE_SHEC_H
 #define CEPH_ERASURE_CODE_SHEC_H
 
-#include "common/Mutex.h"
 #include "erasure-code/ErasureCode.h"
 #include "ErasureCodeShecTableCache.h"
-#include <list>
-
-#define DEFAULT_RULESET_ROOT "default"
-#define DEFAULT_RULESET_FAILURE_DOMAIN "host"
 
 class ErasureCodeShec : public ErasureCode {
 
@@ -47,8 +42,6 @@ public:
   int w;
   int DEFAULT_W;
   int technique;
-  string ruleset_root;
-  string ruleset_failure_domain;
   int *matrix;
 
   ErasureCodeShec(const int _technique,
@@ -63,16 +56,10 @@ public:
     w(0),
     DEFAULT_W(8),
     technique(_technique),
-    ruleset_root(DEFAULT_RULESET_ROOT),
-    ruleset_failure_domain(DEFAULT_RULESET_FAILURE_DOMAIN),
     matrix(0)
   {}
 
   ~ErasureCodeShec() override {}
-
-  int create_ruleset(const string &name,
-			     CrushWrapper &crush,
-			     ostream *ss) const override;
 
   unsigned int get_chunk_count() const override {
     return k + m;

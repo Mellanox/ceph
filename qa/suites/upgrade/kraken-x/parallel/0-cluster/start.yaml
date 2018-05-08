@@ -18,11 +18,16 @@ roles:
   - client.1
   - client.2
   - client.3
+- - client.4
 overrides:
   ceph:
     log-whitelist:
     - scrub mismatch
     - ScrubResult
     - wrongly marked
+    - (POOL_APP_NOT_ENABLED)
+    - overall HEALTH_
     conf:
+      global:
+        enable experimental unrecoverable data corrupting features: "*"
     fs: xfs

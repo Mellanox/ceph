@@ -4,10 +4,7 @@
 #ifndef CEPH_SCRUB_TYPES_H
 #define CEPH_SCRUB_TYPES_H
 
-#include "include/rados/rados_types.hpp"
-#include "common/hobject.h"
 #include "osd/osd_types.h"
-
 
 // wrappers around scrub types to offer the necessary bits other than
 // the minimal set that the lirados requires
@@ -81,6 +78,9 @@ public:
   void set_ss_attr_corrupted() {
     errors |= err_t::SS_ATTR_CORRUPTED;
   }
+  void set_obj_size_oi_mismatch() {
+    errors |= err_t::OBJ_SIZE_OI_MISMATCH;
+  }
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bp);
 };
@@ -115,11 +115,15 @@ struct inconsistent_obj_wrapper : librados::inconsistent_obj_t {
   void set_attr_name_mismatch() {
     errors |= obj_err_t::ATTR_NAME_MISMATCH;
   }
+  void set_snapset_inconsistency() {
+    errors |= obj_err_t::SNAPSET_INCONSISTENCY;
+  }
   void add_shard(const pg_shard_t& pgs, const shard_info_wrapper& shard);
   void set_auth_missing(const hobject_t& hoid,
                         const map<pg_shard_t, ScrubMap*>&,
 			map<pg_shard_t, shard_info_wrapper>&,
-			int &shallow_errors, int &deep_errors);
+			int &shallow_errors, int &deep_errors,
+			const pg_shard_t &primary);
   void set_version(uint64_t ver) { version = ver; }
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bp);

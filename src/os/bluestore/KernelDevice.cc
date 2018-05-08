@@ -130,7 +130,11 @@ int KernelDevice::open(const string& p)
   } else {
     size = st.st_size;
   }
-  size &= ~(block_size);
+  if (cct->_conf->get_val<bool>("bdev_inject_bad_size")) {
+    derr << "injecting bad size; actual 0x" << std::hex << size
+	 << " but using 0x" << (size & ~block_size) << std::dec << dendl;
+    size &= ~(block_size);
+  }
 
   {
     char partition[PATH_MAX], devname[PATH_MAX];
@@ -145,14 +149,16 @@ int KernelDevice::open(const string& p)
     }
   }
 
+  r = _aio_start();
+  if (r < 0) {
+    goto out_fail;
+  }
+
   fs = FS::create_by_fd(fd_direct);
   assert(fs);
 
   // round size down to an even block
   size &= ~(block_size - 1);
-
-  r = _aio_start();
-  assert(r == 0);
 
   dout(1) << __func__
 	  << " size " << size
@@ -261,7 +267,7 @@ int KernelDevice::collect_metadata(string prefix, map<string,string> *pm) const
 
 int KernelDevice::flush()
 {
-  // protect flush with a mutex.  not that we are not really protected
+  // protect flush with a mutex.  note that we are not really protecting
   // data here.  instead, we're ensuring that if any flush() caller
   // sees that io_since_flush is true, they block any racing callers
   // until the flush is observed.  that allows racing threads to be
@@ -308,7 +314,12 @@ int KernelDevice::_aio_start()
     dout(10) << __func__ << dendl;
     int r = aio_queue.init();
     if (r < 0) {
-      derr << __func__ << " failed: " << cpp_strerror(r) << dendl;
+      if (r == -EAGAIN) {
+	derr << __func__ << " io_setup(2) failed with EAGAIN; "
+	     << "try increasing /proc/sys/fs/aio-max-nr" << dendl;
+      } else {
+	derr << __func__ << " io_setup(2) failed: " << cpp_strerror(r) << dendl;
+      }
       return r;
     }
     aio_thread.create("bstore_aio");
@@ -333,12 +344,13 @@ void KernelDevice::_aio_thread()
   int inject_crash_count = 0;
   while (!aio_stop) {
     dout(40) << __func__ << " polling" << dendl;
-    int max = 16;
+    int max = cct->_conf->bdev_aio_reap_max;
     aio_t *aio[max];
     int r = aio_queue.get_next_completed(cct->_conf->bdev_aio_poll_ms,
 					 aio, max);
     if (r < 0) {
       derr << __func__ << " got " << cpp_strerror(r) << dendl;
+      assert(0 == "got unexpected error from io_getevents");
     }
     if (r > 0) {
       dout(30) << __func__ << " got " << r << " completed aios" << dendl;
@@ -359,11 +371,23 @@ void KernelDevice::_aio_thread()
 	io_since_flush.store(true);
 
 	int r = aio[i]->get_return_value();
-	dout(10) << __func__ << " finished aio " << aio[i] << " r " << r
-		 << " ioc " << ioc
-		 << " with " << (ioc->num_running.load() - 1)
-		 << " aios left" << dendl;
-	assert(r >= 0);
+        if (r < 0) {
+          derr << __func__ << " got " << cpp_strerror(r) << dendl;
+          if (ioc->allow_eio && r == -EIO) {
+            ioc->set_return_value(r);
+          } else {
+            assert(0 == "got unexpected error from io_getevents");
+          }
+        } else if (aio[i]->length != (uint64_t)r) {
+          derr << "aio to " << aio[i]->offset << "~" << aio[i]->length
+               << " but returned: " << r << dendl;
+          assert(0 == "unexpected aio error");
+        }
+
+        dout(10) << __func__ << " finished aio " << aio[i] << " r " << r
+                 << " ioc " << ioc
+                 << " with " << (ioc->num_running.load() - 1)
+                 << " aios left" << dendl;
 
 	// NOTE: once num_running and we either call the callback or
 	// call aio_wake we cannot touch ioc or aio[] as the caller
@@ -373,11 +397,7 @@ void KernelDevice::_aio_thread()
 	    aio_callback(aio_callback_priv, ioc->priv);
 	  }
 	} else {
-	  if (ioc->num_running == 1) {
-	    ioc->aio_wake();
-	  } else {
-	    --ioc->num_running;
-	  }
+          ioc->try_aio_wake();
 	}
       }
     }
@@ -478,53 +498,45 @@ void KernelDevice::aio_submit(IOContext *ioc)
 	   << " pending " << ioc->num_pending.load()
 	   << " running " << ioc->num_running.load()
 	   << dendl;
+
   if (ioc->num_pending.load() == 0) {
     return;
   }
+
   // move these aside, and get our end iterator position now, as the
   // aios might complete as soon as they are submitted and queue more
   // wal aio's.
   list<aio_t>::iterator e = ioc->running_aios.begin();
   ioc->running_aios.splice(e, ioc->pending_aios);
-  list<aio_t>::iterator p = ioc->running_aios.begin();
 
   int pending = ioc->num_pending.load();
   ioc->num_running += pending;
   ioc->num_pending -= pending;
   assert(ioc->num_pending.load() == 0);  // we should be only thread doing this
+  assert(ioc->pending_aios.size() == 0);
+  
+  if (cct->_conf->bdev_debug_aio) {
+    list<aio_t>::iterator p = ioc->running_aios.begin();
+    while (p != e) {
+      for (auto& io : p->iov)
+	dout(30) << __func__ << "   iov " << (void*)io.iov_base
+		 << " len " << io.iov_len << dendl;
 
-  bool done = false;
-  while (!done) {
-    aio_t& aio = *p;
-    aio.priv = static_cast<void*>(ioc);
-    dout(20) << __func__ << "  aio " << &aio << " fd " << aio.fd
-	     << " 0x" << std::hex << aio.offset << "~" << aio.length
-	     << std::dec << dendl;
-    for (auto& io : aio.iov)
-      dout(30) << __func__ << "   iov " << (void*)io.iov_base
-	       << " len " << io.iov_len << dendl;
-
-    // be careful: as soon as we submit aio we race with completion.
-    // since we are holding a ref take care not to dereference txc at
-    // all after that point.
-    list<aio_t>::iterator cur = p;
-    ++p;
-    done = (p == e);
-
-    // do not dereference txc (or it's contents) after we submit (if
-    // done == true and we don't loop)
-    int retries = 0;
-    if (cct->_conf->bdev_debug_aio) {
       std::lock_guard<std::mutex> l(debug_queue_lock);
-      debug_aio_link(*cur);
+      debug_aio_link(*p++);
     }
-    int r = aio_queue.submit(*cur, &retries);
-    if (retries)
-      derr << __func__ << " retries " << retries << dendl;
-    if (r) {
-      derr << " aio submit got " << cpp_strerror(r) << dendl;
-      assert(r == 0);
-    }
+  }
+
+  void *priv = static_cast<void*>(ioc);
+  int r, retries = 0;
+  r = aio_queue.submit_batch(ioc->running_aios.begin(), e, 
+			     ioc->num_running.load(), priv, &retries);
+  
+  if (retries)
+    derr << __func__ << " retries " << retries << dendl;
+  if (r < 0) {
+    derr << " aio submit got " << cpp_strerror(r) << dendl;
+    assert(r == 0);
   }
 }
 
@@ -559,6 +571,9 @@ int KernelDevice::_sync_write(uint64_t off, bufferlist &bl, bool buffered)
       return r;
     }
   }
+
+  io_since_flush.store(true);
+
   return 0;
 }
 
@@ -578,7 +593,7 @@ int KernelDevice::write(
   assert(off + len <= size);
 
   if ((!buffered || bl.get_num_buffers() >= IOV_MAX) &&
-      bl.rebuild_aligned_size_and_memory(block_size, block_size)) {
+      bl.rebuild_aligned_size_and_memory(block_size, block_size, IOV_MAX)) {
     dout(20) << __func__ << " rebuilding buffer to be aligned" << dendl;
   }
   dout(40) << "data: ";
@@ -605,7 +620,7 @@ int KernelDevice::aio_write(
   assert(off + len <= size);
 
   if ((!buffered || bl.get_num_buffers() >= IOV_MAX) &&
-      bl.rebuild_aligned_size_and_memory(block_size, block_size)) {
+      bl.rebuild_aligned_size_and_memory(block_size, block_size, IOV_MAX)) {
     dout(20) << __func__ << " rebuilding buffer to be aligned" << dendl;
   }
   dout(40) << "data: ";

@@ -56,6 +56,10 @@ TracepointProvider::Traits osd_tracepoint_traits("libosd_tp.so",
                                                  "osd_tracing");
 TracepointProvider::Traits os_tracepoint_traits("libos_tp.so",
                                                 "osd_objectstore_tracing");
+#ifdef WITH_OSD_INSTRUMENT_FUNCTIONS
+TracepointProvider::Traits cyg_profile_traits("libcyg_profile_tp.so",
+                                                 "osd_function_tracing");
+#endif
 
 } // anonymous namespace
 
@@ -69,11 +73,12 @@ void handle_osd_signal(int signum)
 
 static void usage()
 {
-  cout << "usage: ceph-osd -i <osdid>\n"
+  cout << "usage: ceph-osd -i <ID> [flags]\n"
        << "  --osd-data PATH data directory\n"
        << "  --osd-journal PATH\n"
        << "                    journal file or block device\n"
        << "  --mkfs            create a [new] data directory\n"
+       << "  --mkkey           generate a new secret key. This is normally used in combination with --mkfs\n"
        << "  --convert-filestore\n"
        << "                    run any pending upgrade operations\n"
        << "  --flush-journal   flush all data out of journal\n"
@@ -241,6 +246,7 @@ int main(int argc, const char **argv)
       bl.read_fd(fd, 64);
       if (bl.length()) {
 	store_type = string(bl.c_str(), bl.length() - 1);  // drop \n
+	g_conf->set_val("osd_objectstore", store_type);
 	dout(5) << "object store type is " << store_type << dendl;
       }
       ::close(fd);
@@ -260,29 +266,6 @@ int main(int argc, const char **argv)
   cephd_preload_embedded_plugins();
 #endif
 
-  if (mkfs) {
-    common_init_finish(g_ceph_context);
-    MonClient mc(g_ceph_context);
-    if (mc.build_initial_monmap() < 0)
-      return -1;
-    if (mc.get_monmap_privately() < 0)
-      return -1;
-
-    if (mc.monmap.fsid.is_zero()) {
-      derr << "must specify cluster fsid" << dendl;
-      return -EINVAL;
-    }
-
-    int err = OSD::mkfs(g_ceph_context, store, g_conf->osd_data,
-			mc.monmap.fsid, whoami);
-    if (err < 0) {
-      derr << TEXT_RED << " ** ERROR: error creating empty object store in "
-	   << g_conf->osd_data << ": " << cpp_strerror(-err) << TEXT_NORMAL << dendl;
-      exit(1);
-    }
-    derr << "created object store " << g_conf->osd_data
-	 << " for osd." << whoami << " fsid " << mc.monmap.fsid << dendl;
-  }
   if (mkkey) {
     common_init_finish(g_ceph_context);
     KeyRing *keyring = KeyRing::create_empty();
@@ -311,6 +294,29 @@ int main(int argc, const char **argv)
 	derr << "created new key in keyring " << g_conf->keyring << dendl;
     }
   }
+  if (mkfs) {
+    common_init_finish(g_ceph_context);
+    MonClient mc(g_ceph_context);
+    if (mc.build_initial_monmap() < 0)
+      return -1;
+    if (mc.get_monmap_privately() < 0)
+      return -1;
+
+    if (mc.monmap.fsid.is_zero()) {
+      derr << "must specify cluster fsid" << dendl;
+      return -EINVAL;
+    }
+
+    int err = OSD::mkfs(g_ceph_context, store, g_conf->osd_data,
+			mc.monmap.fsid, whoami);
+    if (err < 0) {
+      derr << TEXT_RED << " ** ERROR: error creating empty object store in "
+	   << g_conf->osd_data << ": " << cpp_strerror(-err) << TEXT_NORMAL << dendl;
+      exit(1);
+    }
+    derr << "created object store " << g_conf->osd_data
+	 << " for osd." << whoami << " fsid " << mc.monmap.fsid << dendl;
+  }
   if (mkfs || mkkey)
     exit(0);
   if (mkjournal) {
@@ -328,28 +334,28 @@ int main(int argc, const char **argv)
   }
   if (check_wants_journal) {
     if (store->wants_journal()) {
-      cout << "yes" << std::endl;
+      cout << "wants journal: yes" << std::endl;
       exit(0);
     } else {
-      cout << "no" << std::endl;
+      cout << "wants journal: no" << std::endl;
       exit(1);
     }
   }
   if (check_allows_journal) {
     if (store->allows_journal()) {
-      cout << "yes" << std::endl;
+      cout << "allows journal: yes" << std::endl;
       exit(0);
     } else {
-      cout << "no" << std::endl;
+      cout << "allows journal: no" << std::endl;
       exit(1);
     }
   }
   if (check_needs_journal) {
     if (store->needs_journal()) {
-      cout << "yes" << std::endl;
+      cout << "needs journal: yes" << std::endl;
       exit(0);
     } else {
-      cout << "no" << std::endl;
+      cout << "needs journal: no" << std::endl;
       exit(1);
     }
   }
@@ -492,9 +498,6 @@ flushjournal_out:
   boost::scoped_ptr<Throttle> client_byte_throttler(
     new Throttle(g_ceph_context, "osd_client_bytes",
 		 g_conf->osd_client_message_size_cap));
-  boost::scoped_ptr<Throttle> client_msg_throttler(
-    new Throttle(g_ceph_context, "osd_client_messages",
-		 g_conf->osd_client_message_cap));
 
   // All feature bits 0 - 34 should be present from dumpling v0.67 forward
   uint64_t osd_required =
@@ -505,7 +508,7 @@ flushjournal_out:
   ms_public->set_default_policy(Messenger::Policy::stateless_server(0));
   ms_public->set_policy_throttlers(entity_name_t::TYPE_CLIENT,
 				   client_byte_throttler.get(),
-				   client_msg_throttler.get());
+				   nullptr);
   ms_public->set_policy(entity_name_t::TYPE_MON,
                                Messenger::Policy::lossy_client(CEPH_FEATURE_UID |
 							       CEPH_FEATURE_PGID64 |
@@ -582,6 +585,9 @@ flushjournal_out:
 
   TracepointProvider::initialize<osd_tracepoint_traits>(g_ceph_context);
   TracepointProvider::initialize<os_tracepoint_traits>(g_ceph_context);
+#ifdef WITH_OSD_INSTRUMENT_FUNCTIONS
+  TracepointProvider::initialize<cyg_profile_traits>(g_ceph_context);
+#endif
 
   MonClient mc(g_ceph_context);
   if (mc.build_initial_monmap() < 0)
@@ -592,6 +598,8 @@ flushjournal_out:
   if (global_init_preload_erasure_code(g_ceph_context) < 0)
     return -1;
 #endif
+
+  srand(time(NULL) + getpid());
 
   osd = new OSD(g_ceph_context,
                 store,
@@ -669,7 +677,6 @@ flushjournal_out:
   delete ms_objecter;
 
   client_byte_throttler.reset();
-  client_msg_throttler.reset();
 
   // cd on exit, so that gmon.out (if any) goes into a separate directory for each node.
   char s[20];

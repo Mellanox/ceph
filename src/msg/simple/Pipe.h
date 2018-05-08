@@ -115,11 +115,6 @@ static const int SM_IOV_MAX = (IOV_MAX >= 1024 ? IOV_MAX / 4 : IOV_MAX);
   private:
     int sd;
     struct iovec msgvec[SM_IOV_MAX];
-#if !defined(MSG_NOSIGNAL) && !defined(SO_NOSIGPIPE)
-    sigset_t sigpipe_mask;
-    bool sigpipe_pending;
-    bool sigpipe_unblock;
-#endif
 
   public:
     int port;
@@ -129,7 +124,7 @@ static const int SM_IOV_MAX = (IOV_MAX >= 1024 ? IOV_MAX / 4 : IOV_MAX);
     
     Mutex pipe_lock;
     int state;
-    atomic_t state_closed; // non-zero iff state = STATE_CLOSED
+    std::atomic<bool> state_closed = { false }; // true iff state = STATE_CLOSED
 
     // session_security handles any signatures or encryptions required for this pipe's msgs. PLR
 
@@ -187,10 +182,6 @@ static const int SM_IOV_MAX = (IOV_MAX >= 1024 ? IOV_MAX / 4 : IOV_MAX);
     int write_ack(uint64_t s);
     int write_keepalive();
     int write_keepalive2(char tag, const utime_t &t);
-
-    void suppress_sigpipe();
-    void restore_sigpipe();
-
 
     void fault(bool reader=false);
 

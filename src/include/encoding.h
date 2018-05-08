@@ -197,22 +197,6 @@ inline void encode(const char *s, bufferlist& bl)
 }
 
 
-// array
-template<class A>
-inline void encode_array_nohead(const A a[], int n, bufferlist &bl)
-{
-  for (int i=0; i<n; i++)
-    encode(a[i], bl);
-}
-template<class A>
-inline void decode_array_nohead(A a[], int n, bufferlist::iterator &p)
-{
-  for (int i=0; i<n; i++)
-    decode(a[i], p);
-}
-
-
-
 // -----------------------------
 // buffers
 
@@ -313,16 +297,16 @@ inline void encode(const boost::optional<T> &p, bufferlist &bl)
 #pragma GCC diagnostic ignored "-Wpragmas"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wuninitialized"
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 template<typename T>
 inline void decode(boost::optional<T> &p, bufferlist::iterator &bp)
 {
   __u8 present;
   ::decode(present, bp);
   if (present) {
-    T t;
-    p = t;
+    p = T{};
     decode(p.get(), bp);
+  } else {
+    p = boost::none;
   }
 }
 #pragma GCC diagnostic pop
@@ -512,6 +496,7 @@ decode(boost::container::flat_set<T, Comp, Alloc>& s, bufferlist::iterator& p)
   __u32 n;
   decode(n, p);
   s.clear();
+  s.reserve(n);
   while (n--) {
     T v;
     decode(v, p);
@@ -532,6 +517,7 @@ inline typename std::enable_if<!traits::supported>::type
 decode_nohead(int len, boost::container::flat_set<T, Comp, Alloc>& s,
 	      bufferlist::iterator& p)
 {
+  s.reserve(len);
   for (int i=0; i<len; i++) {
     T v;
     decode(v, p);
@@ -817,6 +803,7 @@ template<class T, class U, class Comp, class Alloc,
   __u32 n;
   decode(n, p);
   m.clear();
+  m.reserve(n);
   while (n--) {
     T k;
     decode(k, p);
@@ -829,6 +816,7 @@ inline void decode_noclear(boost::container::flat_map<T,U,Comp,Alloc>& m,
 {
   __u32 n;
   decode(n, p);
+  m.reserve(m.size() + n);
   while (n--) {
     T k;
     decode(k, p);

@@ -81,7 +81,7 @@ Note that we still have two active MDSs: the ranks still exist even though
 we have decreased max_mds, because max_mds only restricts creation
 of new ranks.
 
-Next, use the ``ceph mds deactivate <rank>`` command to remove the
+Next, use the ``ceph mds deactivate <role>`` command to remove the
 unneeded rank:
 
 ::
@@ -92,6 +92,9 @@ unneeded rank:
     # fsmap e11: 2/2/1 up {0=a=up:active,1=c=up:stopping}, 1 up:standby
     # fsmap e12: 1/1/1 up {0=a=up:active}, 1 up:standby
     # fsmap e13: 1/1/1 up {0=a=up:active}, 2 up:standby
+
+See :doc:`/cephfs/administration` for more details which forms ``<role>`` can
+take.
 
 The deactivated rank will first enter the stopping state for a period
 of time while it hands off its share of the metadata to the remaining
@@ -122,6 +125,7 @@ extended attribute of directories. The name of this extended attribute is
 ``ceph.dir.pin``.  Users can set this attribute using standard commands:
 
 ::
+
     setfattr -n ceph.dir.pin -v 2 path/to/dir
 
 The value of the extended attribute is the rank to assign the directory subtree
@@ -133,9 +137,11 @@ children. However, the parents pin can be overriden by setting the child
 directory's export pin. For example:
 
 ::
+
     mkdir -p a/b
     # "a" and "a/b" both start without an export pin set
     setfattr -n ceph.dir.pin -v 1 a/
     # a and b are now pinned to rank 1
     setfattr -n ceph.dir.pin -v 0 a/b
     # a/b is now pinned to rank 0 and a/ and the rest of its children are still pinned to rank 1
+

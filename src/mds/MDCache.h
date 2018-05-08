@@ -98,6 +98,13 @@ enum {
   // How many inodes ever completed size recovery
   l_mdc_recovery_completed,
 
+  l_mdss_ireq_enqueue_scrub,
+  l_mdss_ireq_exportdir,
+  l_mdss_ireq_flush,
+  l_mdss_ireq_fragmentdir,
+  l_mdss_ireq_fragstats,
+  l_mdss_ireq_inodestats,
+
   l_mdc_last,
 };
 
@@ -114,8 +121,10 @@ class MDCache {
 
   // -- my cache --
   LRU lru;   // dentry lru for expiring items from cache
+  LRU bottom_lru; // dentries that should be trimmed ASAP
  protected:
-  ceph::unordered_map<vinodeno_t,CInode*> inode_map;  // map of inodes by ino
+  ceph::unordered_map<inodeno_t,CInode*> inode_map;  // map of head inodes by ino
+  map<vinodeno_t, CInode*> snap_inode_map;  // map of snap inodes by ino
   CInode *root;                            // root inode
   CInode *myin;                            // .ceph/mds%d dir
 
@@ -138,6 +147,38 @@ class MDCache {
   bool exceeded_size_limit;
 
 public:
+  static uint64_t cache_limit_inodes(void) {
+    return g_conf->get_val<int64_t>("mds_cache_size");
+  }
+  static uint64_t cache_limit_memory(void) {
+    return g_conf->get_val<uint64_t>("mds_cache_memory_limit");
+  }
+  static double cache_reservation(void) {
+    return g_conf->get_val<double>("mds_cache_reservation");
+  }
+  static double cache_mid(void) {
+    return g_conf->get_val<double>("mds_cache_mid");
+  }
+  static double cache_health_threshold(void) {
+    return g_conf->get_val<double>("mds_health_cache_threshold");
+  }
+  double cache_toofull_ratio(void) const {
+    uint64_t inode_limit = cache_limit_inodes();
+    double inode_reserve = inode_limit*(1.0-cache_reservation());
+    double memory_reserve = cache_limit_memory()*(1.0-cache_reservation());
+    return fmax(0.0, fmax((cache_size()-memory_reserve)/memory_reserve, inode_limit == 0 ? 0.0 : (CInode::count()-inode_reserve)/inode_reserve));
+  }
+  bool cache_toofull(void) const {
+    return cache_toofull_ratio() > 0.0;
+  }
+  uint64_t cache_size(void) const {
+    return mempool::get_pool(mempool::mds_co::id).allocated_bytes();
+  }
+  bool cache_overfull(void) const {
+    uint64_t inode_limit = cache_limit_inodes();
+    return (inode_limit > 0 && CInode::count() > inode_limit*cache_health_threshold()) || (cache_size() > cache_limit_memory()*cache_health_threshold());
+  }
+
   void advance_stray() {
     stray_index = (stray_index+1)%NUM_STRAY;
   }
@@ -154,10 +195,14 @@ public:
   }
 
   void maybe_eval_stray(CInode *in, bool delay=false);
+  void clear_dirty_bits_for_stray(CInode* diri);
+
   bool is_readonly() { return readonly; }
   void force_readonly();
 
   DecayRate decayrate;
+
+  int num_shadow_inodes;
 
   int num_inodes_with_caps;
 
@@ -193,6 +238,11 @@ public:
     stray_manager.notify_stray_created();
   }
 
+  void eval_remote(CDentry *dn)
+  {
+    stray_manager.eval_remote(dn);
+  }
+
   // -- client caps --
   uint64_t              last_cap_id;
   
@@ -206,20 +256,20 @@ public:
     frag_t frag;
     snapid_t snap;
     filepath want_path;
-    MDSCacheObject *base;
+    CInode *basei;
     bool want_base_dir;
     bool want_xlocked;
 
     discover_info_t() :
-      tid(0), mds(-1), snap(CEPH_NOSNAP), base(NULL),
+      tid(0), mds(-1), snap(CEPH_NOSNAP), basei(NULL),
       want_base_dir(false), want_xlocked(false) {}
     ~discover_info_t() {
-      if (base)
-	base->put(MDSCacheObject::PIN_DISCOVERBASE);
+      if (basei)
+	basei->put(MDSCacheObject::PIN_DISCOVERBASE);
     }
-    void pin_base(MDSCacheObject *b) {
-      base = b;
-      base->get(MDSCacheObject::PIN_DISCOVERBASE);
+    void pin_base(CInode *b) {
+      basei = b;
+      basei->get(MDSCacheObject::PIN_DISCOVERBASE);
     }
   };
 
@@ -261,9 +311,9 @@ protected:
 public:
   bool is_subtrees() { return !subtrees.empty(); }
   void list_subtrees(list<CDir*>& ls);
-  void adjust_subtree_auth(CDir *root, mds_authority_t auth, bool do_eval=true);
-  void adjust_subtree_auth(CDir *root, mds_rank_t a, mds_rank_t b=CDIR_AUTH_UNKNOWN, bool do_eval=true) {
-    adjust_subtree_auth(root, mds_authority_t(a,b), do_eval); 
+  void adjust_subtree_auth(CDir *root, mds_authority_t auth);
+  void adjust_subtree_auth(CDir *root, mds_rank_t a, mds_rank_t b=CDIR_AUTH_UNKNOWN) {
+    adjust_subtree_auth(root, mds_authority_t(a,b));
   }
   void adjust_bounded_subtree_auth(CDir *dir, set<CDir*>& bounds, mds_authority_t auth);
   void adjust_bounded_subtree_auth(CDir *dir, set<CDir*>& bounds, mds_rank_t a) {
@@ -275,7 +325,7 @@ public:
   }
   void map_dirfrag_set(list<dirfrag_t>& dfs, set<CDir*>& result);
   void try_subtree_merge(CDir *root);
-  void try_subtree_merge_at(CDir *root, bool do_eval=true);
+  void try_subtree_merge_at(CDir *root, set<CInode*> *to_eval);
   void subtree_merge_writebehind_finish(CInode *in, MutationRef& mut);
   void eval_subtree_root(CInode *diri);
   CDir *get_subtree_root(CDir *dir);
@@ -294,8 +344,7 @@ public:
   void verify_subtree_bounds(CDir *root, const list<dirfrag_t>& bounds);
 
   void project_subtree_rename(CInode *diri, CDir *olddir, CDir *newdir);
-  void adjust_subtree_after_rename(CInode *diri, CDir *olddir,
-                                   bool pop, bool imported = false);
+  void adjust_subtree_after_rename(CInode *diri, CDir *olddir, bool pop);
 
   void get_auth_subtrees(set<CDir*>& s);
   void get_fullauth_subtrees(set<CDir*>& s);
@@ -491,6 +540,7 @@ protected:
   bool rejoins_pending;
   set<mds_rank_t> rejoin_gather;      // nodes from whom i need a rejoin
   set<mds_rank_t> rejoin_sent;        // nodes i sent a rejoin to
+  set<mds_rank_t> rejoin_ack_sent;    // nodes i sent a rejoin to
   set<mds_rank_t> rejoin_ack_gather;  // nodes from whom i need a rejoin ack
   map<mds_rank_t,map<inodeno_t,map<client_t,Capability::Import> > > rejoin_imported_caps;
   map<inodeno_t,pair<mds_rank_t,map<client_t,Capability::Export> > > rejoin_slave_exports;
@@ -656,12 +706,12 @@ public:
   CInode *get_root() { return root; }
   CInode *get_myin() { return myin; }
 
-  // cache
-  void set_cache_size(size_t max) { lru.lru_set_max(max); }
   size_t get_cache_size() { return lru.lru_get_size(); }
 
   // trimming
-  bool trim(int max=-1, int count=-1);   // trim cache
+  bool trim(uint64_t count=0);
+private:
+  void trim_lru(uint64_t count, map<mds_rank_t, MCacheExpire*>& expiremap);
   bool trim_dentry(CDentry *dn, map<mds_rank_t, MCacheExpire*>& expiremap);
   void trim_dirfrag(CDir *dir, CDir *con,
 		    map<mds_rank_t, MCacheExpire*>& expiremap);
@@ -669,6 +719,7 @@ public:
 		  map<mds_rank_t,class MCacheExpire*>& expiremap);
   void send_expire_messages(map<mds_rank_t, MCacheExpire*>& expiremap);
   void trim_non_auth();      // trim out trimmable non-auth items
+public:
   bool trim_non_auth_subtree(CDir *directory);
   void standby_trim_segment(LogSegment *ls);
   void try_trim_non_auth_subtree(CDir *dir);
@@ -714,14 +765,24 @@ public:
 
   // inode_map
   bool have_inode(vinodeno_t vino) {
-    return inode_map.count(vino) ? true:false;
+    if (vino.snapid == CEPH_NOSNAP)
+      return inode_map.count(vino.ino) ? true : false;
+    else
+      return snap_inode_map.count(vino) ? true : false;
   }
   bool have_inode(inodeno_t ino, snapid_t snap=CEPH_NOSNAP) {
     return have_inode(vinodeno_t(ino, snap));
   }
   CInode* get_inode(vinodeno_t vino) {
-    if (have_inode(vino))
-      return inode_map[vino];
+    if (vino.snapid == CEPH_NOSNAP) {
+      auto p = inode_map.find(vino.ino);
+      if (p != inode_map.end())
+	return p->second;
+    } else {
+      auto p = snap_inode_map.find(vino);
+      if (p != snap_inode_map.end())
+	return p->second;
+    }
     return NULL;
   }
   CInode* get_inode(inodeno_t ino, snapid_t s=CEPH_NOSNAP) {
@@ -766,28 +827,19 @@ public:
   }
 public:
   void touch_dentry(CDentry *dn) {
-    // touch ancestors
-    if (dn->get_dir()->get_inode()->get_projected_parent_dn())
-      touch_dentry(dn->get_dir()->get_inode()->get_projected_parent_dn());
-    
-    // touch me
-    if (dn->is_auth())
-      lru.lru_touch(dn);
-    else
-      lru.lru_midtouch(dn);
+    if (dn->state_test(CDentry::STATE_BOTTOMLRU)) {
+      bottom_lru.lru_midtouch(dn);
+    } else {
+      if (dn->is_auth())
+	lru.lru_touch(dn);
+      else
+	lru.lru_midtouch(dn);
+    }
   }
   void touch_dentry_bottom(CDentry *dn) {
+    if (dn->state_test(CDentry::STATE_BOTTOMLRU))
+      return;
     lru.lru_bottouch(dn);
-    if (dn->get_projected_linkage()->is_primary() &&
-	dn->get_dir()->inode->is_stray()) {
-      CInode *in = dn->get_projected_linkage()->get_inode();
-      if (in->has_dirfrags()) {
-	list<CDir*> ls;
-	in->get_dirfrags(ls);
-	for (list<CDir*>::iterator p = ls.begin(); p != ls.end(); ++p)
-	  (*p)->touch_dentries_bottom();
-      }
-    }
   }
 protected:
 
@@ -976,7 +1028,6 @@ public:
 
   // -- stray --
 public:
-  void eval_remote(CDentry *dn);
   void fetch_backtrace(inodeno_t ino, int64_t pool, bufferlist& bl, Context *fin);
   uint64_t get_num_strays() const { return stray_manager.get_num_strays(); }
 
@@ -997,25 +1048,12 @@ protected:
   friend class C_MDC_Join;
 
 public:
-  void replicate_dir(CDir *dir, mds_rank_t to, bufferlist& bl) {
-    dirfrag_t df = dir->dirfrag();
-    ::encode(df, bl);
-    dir->encode_replica(to, bl);
-  }
-  void replicate_dentry(CDentry *dn, mds_rank_t to, bufferlist& bl) {
-    ::encode(dn->name, bl);
-    ::encode(dn->last, bl);
-    dn->encode_replica(to, bl);
-  }
+  void replicate_dir(CDir *dir, mds_rank_t to, bufferlist& bl);
+  void replicate_dentry(CDentry *dn, mds_rank_t to, bufferlist& bl);
   void replicate_inode(CInode *in, mds_rank_t to, bufferlist& bl,
-		       uint64_t features) {
-    ::encode(in->inode.ino, bl);  // bleh, minor assymetry here
-    ::encode(in->last, bl);
-    in->encode_replica(to, bl, features);
-  }
+		       uint64_t features);
   
   CDir* add_replica_dir(bufferlist::iterator& p, CInode *diri, mds_rank_t from, list<MDSInternalContextBase*>& finished);
-  CDir* forge_replica_dir(CInode *diri, frag_t fg, mds_rank_t from);
   CDentry *add_replica_dentry(bufferlist::iterator& p, CDir *dir, list<MDSInternalContextBase*>& finished);
   CInode *add_replica_inode(bufferlist::iterator& p, CDentry *dn, list<MDSInternalContextBase*>& finished);
 
@@ -1122,14 +1160,16 @@ public:
   void discard_delayed_expire(CDir *dir);
 
 protected:
-  void dump_cache(const char *fn, Formatter *f,
+  int dump_cache(const char *fn, Formatter *f,
 		  const std::string& dump_root = "",
 		  int depth = -1);
 public:
-  void dump_cache() {dump_cache(NULL, NULL);}
-  void dump_cache(const std::string &filename);
-  void dump_cache(Formatter *f);
-  void dump_cache(const std::string& dump_root, int depth, Formatter *f);
+  int dump_cache() { return dump_cache(NULL, NULL); }
+  int dump_cache(const std::string &filename);
+  int dump_cache(Formatter *f);
+  int dump_cache(const std::string& dump_root, int depth, Formatter *f);
+
+  int cache_status(Formatter *f);
 
   void dump_resolve_status(Formatter *f) const;
   void dump_rejoin_status(Formatter *f) const;
@@ -1142,7 +1182,7 @@ public:
   CInode *hack_pick_random_inode() {
     assert(!inode_map.empty());
     int n = rand() % inode_map.size();
-    ceph::unordered_map<vinodeno_t,CInode*>::iterator p = inode_map.begin();
+    auto p = inode_map.begin();
     while (n--) ++p;
     return p->second;
   }

@@ -5,13 +5,13 @@
 #define CEPH_LIBRBD_IO_OBJECT_REQUEST_H
 
 #include "include/int_types.h"
-
-#include <map>
-
-#include "common/snap_types.h"
 #include "include/buffer.h"
 #include "include/rados/librados.hpp"
+#include "common/snap_types.h"
+#include "common/zipkin_trace.h"
 #include "librbd/ObjectMap.h"
+#include "librbd/io/Types.h"
+#include <map>
 
 class Context;
 
@@ -22,17 +22,13 @@ struct ImageCtx;
 namespace io {
 
 struct AioCompletion;
-class CopyupRequest;
-class ObjectRemoveRequest;
-class ObjectTruncateRequest;
-class ObjectWriteRequest;
-class ObjectZeroRequest;
+template <typename> class CopyupRequest;
 
 struct ObjectRequestHandle {
   virtual ~ObjectRequestHandle() {
   }
 
-  virtual void complete(int r) = 0;
+  virtual void fail(int r) = 0;
   virtual void send() = 0;
 };
 
@@ -44,30 +40,21 @@ struct ObjectRequestHandle {
 template <typename ImageCtxT = ImageCtx>
 class ObjectRequest : public ObjectRequestHandle {
 public:
-  typedef std::vector<std::pair<uint64_t, uint64_t> > Extents;
-
-  static ObjectRequest* create_remove(ImageCtxT *ictx,
-                                      const std::string &oid,
-                                      uint64_t object_no,
-                                      const ::SnapContext &snapc,
-                                      Context *completion);
-  static ObjectRequest* create_truncate(ImageCtxT *ictx,
-                                        const std::string &oid,
-                                        uint64_t object_no,
-                                        uint64_t object_off,
-                                        const ::SnapContext &snapc,
-                                        Context *completion);
   static ObjectRequest* create_write(ImageCtxT *ictx, const std::string &oid,
                                      uint64_t object_no,
                                      uint64_t object_off,
                                      const ceph::bufferlist &data,
-                                     const ::SnapContext &snapc,
-                                     Context *completion, int op_flags);
-  static ObjectRequest* create_zero(ImageCtxT *ictx, const std::string &oid,
-                                    uint64_t object_no, uint64_t object_off,
-                                    uint64_t object_len,
-                                    const ::SnapContext &snapc,
-                                    Context *completion);
+                                     const ::SnapContext &snapc, int op_flags,
+				     const ZTracer::Trace &parent_trace,
+                                     Context *completion);
+  static ObjectRequest* create_discard(ImageCtxT *ictx, const std::string &oid,
+                                       uint64_t object_no, uint64_t object_off,
+                                       uint64_t object_len,
+                                       const ::SnapContext &snapc,
+                                       bool disable_clone_remove,
+                                       bool update_object_map,
+                                       const ZTracer::Trace &parent_trace,
+                                       Context *completion);
   static ObjectRequest* create_writesame(ImageCtxT *ictx,
                                          const std::string &oid,
                                          uint64_t object_no,
@@ -75,42 +62,55 @@ public:
                                          uint64_t object_len,
                                          const ceph::bufferlist &data,
                                          const ::SnapContext &snapc,
-                                         Context *completion, int op_flags);
+					 int op_flags,
+					 const ZTracer::Trace &parent_trace,
+                                         Context *completion);
+  static ObjectRequest* create_compare_and_write(ImageCtxT *ictx,
+                                                 const std::string &oid,
+                                                 uint64_t object_no,
+                                                 uint64_t object_off,
+                                                 const ceph::bufferlist &cmp_data,
+                                                 const ceph::bufferlist &write_data,
+                                                 const ::SnapContext &snapc,
+                                                 uint64_t *mismatch_offset, int op_flags,
+                                                 const ZTracer::Trace &parent_trace,
+                                                 Context *completion);
 
-  ObjectRequest(ImageCtx *ictx, const std::string &oid,
+  ObjectRequest(ImageCtxT *ictx, const std::string &oid,
                 uint64_t objectno, uint64_t off, uint64_t len,
-                librados::snap_t snap_id,
-                Context *completion, bool hide_enoent);
-  ~ObjectRequest() override {}
+                librados::snap_t snap_id, const char *trace_name,
+                const ZTracer::Trace &parent_trace, Context *completion);
+  ~ObjectRequest() override {
+    m_trace.event("finish");
+  }
 
-  virtual void add_copyup_ops(librados::ObjectWriteOperation *wr) {};
+  static void add_write_hint(ImageCtxT& image_ctx,
+                             librados::ObjectWriteOperation *wr);
 
-  void complete(int r) override;
+  void fail(int r) {
+    finish(r);
+  }
 
-  virtual bool should_complete(int r) = 0;
   void send() override = 0;
 
   bool has_parent() const {
     return m_has_parent;
   }
 
-  virtual bool is_op_payload_empty() const {
-    return false;
-  }
-
   virtual const char *get_op_type() const = 0;
-  virtual bool pre_object_map_update(uint8_t *new_state) = 0;
 
 protected:
-  bool compute_parent_extents();
+  bool compute_parent_extents(Extents *parent_extents);
 
-  ImageCtx *m_ictx;
+  ImageCtxT *m_ictx;
   std::string m_oid;
   uint64_t m_object_no, m_object_off, m_object_len;
   librados::snap_t m_snap_id;
   Context *m_completion;
-  Extents m_parent_extents;
-  bool m_hide_enoent;
+  ZTracer::Trace m_trace;
+
+  void async_finish(int r);
+  void finish(int r);
 
 private:
   bool m_has_parent = false;
@@ -119,27 +119,26 @@ private:
 template <typename ImageCtxT = ImageCtx>
 class ObjectReadRequest : public ObjectRequest<ImageCtxT> {
 public:
-  typedef std::vector<std::pair<uint64_t, uint64_t> > Extents;
   typedef std::map<uint64_t, uint64_t> ExtentMap;
 
   static ObjectReadRequest* create(ImageCtxT *ictx, const std::string &oid,
                                    uint64_t objectno, uint64_t offset,
-                                   uint64_t len, Extents &buffer_extents,
-                                   librados::snap_t snap_id, bool sparse,
-                                   Context *completion, int op_flags) {
+                                   uint64_t len, librados::snap_t snap_id,
+                                   int op_flags, bool cache_initiated,
+                                   const ZTracer::Trace &parent_trace,
+                                   Context *completion) {
     return new ObjectReadRequest(ictx, oid, objectno, offset, len,
-                                 buffer_extents, snap_id, sparse, completion,
-                                 op_flags);
+                                 snap_id, op_flags, cache_initiated,
+                                 parent_trace, completion);
   }
 
   ObjectReadRequest(ImageCtxT *ictx, const std::string &oid,
                     uint64_t objectno, uint64_t offset, uint64_t len,
-                    Extents& buffer_extents, librados::snap_t snap_id,
-                    bool sparse, Context *completion, int op_flags);
+                    librados::snap_t snap_id, int op_flags,
+                    bool cache_initiated, const ZTracer::Trace &parent_trace,
+                    Context *completion);
 
-  bool should_complete(int r) override;
   void send() override;
-  void guard_read();
 
   inline uint64_t get_offset() const {
     return this->m_object_off;
@@ -150,9 +149,6 @@ public:
   ceph::bufferlist &data() {
     return m_read_data;
   }
-  const Extents &get_buffer_extents() const {
-    return m_buffer_extents;
-  }
   ExtentMap &get_extent_map() {
     return m_ext_map;
   }
@@ -161,143 +157,168 @@ public:
     return "read";
   }
 
-  bool pre_object_map_update(uint8_t *new_state) override {
-    return false;
-  }
-
 private:
-  Extents m_buffer_extents;
-  bool m_tried_parent;
-  bool m_sparse;
+  /**
+   * @verbatim
+   *
+   *           <start>
+   *              |
+   *              |
+   *    /--------/ \--------\
+   *    |                   |
+   *    | (cache            | (cache
+   *    v  disabled)        v  enabled)
+   * READ_OBJECT      READ_CACHE
+   *    |                   |
+   *    |/------------------/
+   *    |
+   *    v (skip if not needed)
+   * READ_PARENT
+   *    |
+   *    v (skip if not needed)
+   * COPYUP
+   *    |
+   *    v
+   * <finish>
+   *
+   * @endverbatim
+   */
+
   int m_op_flags;
+  bool m_cache_initiated;
+
   ceph::bufferlist m_read_data;
   ExtentMap m_ext_map;
 
-  /**
-   * Reads go through the following state machine to deal with
-   * layering:
-   *
-   *                          need copyup
-   * LIBRBD_AIO_READ_GUARD ---------------> LIBRBD_AIO_READ_COPYUP
-   *           |                                       |
-   *           v                                       |
-   *         done <------------------------------------/
-   *           ^
-   *           |
-   * LIBRBD_AIO_READ_FLAT
-   *
-   * Reads start in LIBRBD_AIO_READ_GUARD or _FLAT, depending on
-   * whether there is a parent or not.
-   */
-  enum read_state_d {
-    LIBRBD_AIO_READ_GUARD,
-    LIBRBD_AIO_READ_COPYUP,
-    LIBRBD_AIO_READ_FLAT
-  };
+  void read_cache();
+  void handle_read_cache(int r);
 
-  read_state_d m_state;
+  void read_object();
+  void handle_read_object(int r);
 
-  void send_copyup();
+  void read_parent();
+  void handle_read_parent(int r);
 
-  void read_from_parent(Extents&& image_extents);
+  void copyup();
 };
 
-class AbstractObjectWriteRequest : public ObjectRequest<> {
+template <typename ImageCtxT = ImageCtx>
+class AbstractObjectWriteRequest : public ObjectRequest<ImageCtxT> {
 public:
-  AbstractObjectWriteRequest(ImageCtx *ictx, const std::string &oid,
+  AbstractObjectWriteRequest(ImageCtxT *ictx, const std::string &oid,
                              uint64_t object_no, uint64_t object_off,
                              uint64_t len, const ::SnapContext &snapc,
-                             Context *completion, bool hide_enoent);
+			     const char *trace_name,
+			     const ZTracer::Trace &parent_trace,
+                             Context *completion);
 
-  void add_copyup_ops(librados::ObjectWriteOperation *wr) override
-  {
+  virtual bool is_empty_write_op() const {
+    return false;
+  }
+
+  virtual uint8_t get_pre_write_object_map_state() const {
+    return OBJECT_EXISTS;
+  }
+
+  virtual void add_copyup_ops(librados::ObjectWriteOperation *wr) {
     add_write_ops(wr);
   }
 
-  bool should_complete(int r) override;
+  void handle_copyup(int r);
+
   void send() override;
 
-  /**
-   * Writes go through the following state machine to deal with
-   * layering and the object map:
-   *
-   *   <start>
-   *      |
-   *      |\
-   *      | \       -or-
-   *      |  ---------------------------------> LIBRBD_AIO_WRITE_PRE
-   *      |                          .                            |
-   *      |                          .                            |
-   *      |                          .                            v
-   *      |                          . . .  . > LIBRBD_AIO_WRITE_FLAT. . .
-   *      |                                                       |      .
-   *      |                                                       |      .
-   *      |                                                       |      .
-   *      v                need copyup   (copyup performs pre)    |      .
-   * LIBRBD_AIO_WRITE_GUARD -----------> LIBRBD_AIO_WRITE_COPYUP  |      .
-   *  .       |                               |        .          |      .
-   *  .       |                               |        .          |      .
-   *  .       |                         /-----/        .          |      .
-   *  .       |                         |              .          |      .
-   *  .       \-------------------\     |     /-------------------/      .
-   *  .                           |     |     |        .                 .
-   *  .                           v     v     v        .                 .
-   *  .                       LIBRBD_AIO_WRITE_POST    .                 .
-   *  .                               |                .                 .
-   *  .                               |  . . . . . . . .                 .
-   *  .                               |  .                               .
-   *  .                               v  v                               .
-   *  . . . . . . . . . . . . . . > <finish> < . . . . . . . . . . . . . .
-   *
-   * The _PRE/_POST states are skipped if the object map is disabled.
-   * The write starts in _WRITE_GUARD or _FLAT depending on whether or not
-   * there is a parent overlap.
-   */
 protected:
-  enum write_state_d {
-    LIBRBD_AIO_WRITE_GUARD,
-    LIBRBD_AIO_WRITE_COPYUP,
-    LIBRBD_AIO_WRITE_FLAT,
-    LIBRBD_AIO_WRITE_PRE,
-    LIBRBD_AIO_WRITE_POST,
-    LIBRBD_AIO_WRITE_ERROR
-  };
+  bool m_full_object = false;
 
-  write_state_d m_state;
-  librados::ObjectWriteOperation m_write;
-  uint64_t m_snap_seq;
-  std::vector<librados::snap_t> m_snaps;
-  bool m_object_exist;
-  bool m_guard = true;
-
-  virtual void add_write_ops(librados::ObjectWriteOperation *wr) = 0;
-  virtual void guard_write();
-  virtual bool post_object_map_update() {
+  virtual bool is_no_op_for_nonexistent_object() const {
     return false;
   }
-  virtual void send_write();
-  virtual void send_write_op();
-  virtual void handle_write_guard();
+  virtual bool is_object_map_update_enabled() const {
+    return true;
+  }
+  virtual bool is_post_copyup_write_required() const {
+    return false;
+  }
+  virtual bool is_non_existent_post_write_object_map_state() const {
+    return false;
+  }
 
-  void send_pre_object_map_update();
+  virtual void add_write_hint(librados::ObjectWriteOperation *wr);
+  virtual void add_write_ops(librados::ObjectWriteOperation *wr) = 0;
+
+  virtual int filter_write_result(int r) const {
+    return r;
+  }
 
 private:
-  bool send_post_object_map_update();
-  void send_copyup();
+  /**
+   * @verbatim
+   *
+   * <start>
+   *    |
+   *    v           (no-op write request)
+   * DETECT_NO_OP . . . . . . . . . . . . . . . . . . .
+   *    |                                             .
+   *    v (skip if not required/disabled)             .
+   * PRE_UPDATE_OBJECT_MAP                            .
+   *    |          .                                  .
+   *    |          . (child dne)                      .
+   *    |          . . . . . . . . .                  .
+   *    |                          .                  .
+   *    |   (post-copyup write)    .                  .
+   *    | . . . . . . . . . . . .  .                  .
+   *    | .                     .  .                  .
+   *    v v                     .  v                  .
+   *   WRITE . . . . . . . . > COPYUP (if required)   .
+   *    |                       |                     .
+   *    |/----------------------/                     .
+   *    |                                             .
+   *    v (skip if not required/disabled)             .
+   * POST_UPDATE_OBJECT_MAP                           .
+   *    |                                             .
+   *    v                                             .
+   * <finish> < . . . . . . . . . . . . . . . . . . . .
+   *
+   * @endverbatim
+   */
+
+  uint64_t m_snap_seq;
+  std::vector<librados::snap_t> m_snaps;
+
+  Extents m_parent_extents;
+  bool m_object_may_exist = false;
+  bool m_copyup_enabled = true;
+  bool m_copyup_in_progress = false;
+
+  void pre_write_object_map_update();
+  void handle_pre_write_object_map_update(int r);
+
+  void write_object();
+  void handle_write_object(int r);
+
+  void copyup();
+
+  void post_write_object_map_update();
+  void handle_post_write_object_map_update(int r);
+
 };
 
-class ObjectWriteRequest : public AbstractObjectWriteRequest {
+template <typename ImageCtxT = ImageCtx>
+class ObjectWriteRequest : public AbstractObjectWriteRequest<ImageCtxT> {
 public:
-  ObjectWriteRequest(ImageCtx *ictx, const std::string &oid, uint64_t object_no,
-                     uint64_t object_off, const ceph::bufferlist &data,
-                     const ::SnapContext &snapc, Context *completion,
-                     int op_flags)
-    : AbstractObjectWriteRequest(ictx, oid, object_no, object_off,
-                                 data.length(), snapc, completion, false),
+  ObjectWriteRequest(ImageCtxT *ictx, const std::string &oid,
+                     uint64_t object_no, uint64_t object_off,
+                     const ceph::bufferlist &data, const ::SnapContext &snapc,
+                     int op_flags, const ZTracer::Trace &parent_trace,
+                     Context *completion)
+    : AbstractObjectWriteRequest<ImageCtxT>(ictx, oid, object_no, object_off,
+                                            data.length(), snapc, "write",
+                                            parent_trace, completion),
       m_write_data(data), m_op_flags(op_flags) {
   }
 
-  bool is_op_payload_empty() const override {
+  bool is_empty_write_op() const override {
     return (m_write_data.length() == 0);
   }
 
@@ -305,168 +326,121 @@ public:
     return "write";
   }
 
-  bool pre_object_map_update(uint8_t *new_state) override {
-    *new_state = OBJECT_EXISTS;
-    return true;
-  }
-
 protected:
   void add_write_ops(librados::ObjectWriteOperation *wr) override;
-
-  void send_write() override;
 
 private:
   ceph::bufferlist m_write_data;
   int m_op_flags;
 };
 
-class ObjectRemoveRequest : public AbstractObjectWriteRequest {
+template <typename ImageCtxT = ImageCtx>
+class ObjectDiscardRequest : public AbstractObjectWriteRequest<ImageCtxT> {
 public:
-  ObjectRemoveRequest(ImageCtx *ictx, const std::string &oid,
-                      uint64_t object_no, const ::SnapContext &snapc,
-                      Context *completion)
-    : AbstractObjectWriteRequest(ictx, oid, object_no, 0, 0, snapc, completion,
-                                 true),
-      m_object_state(OBJECT_NONEXISTENT) {
+  ObjectDiscardRequest(ImageCtxT *ictx, const std::string &oid,
+                       uint64_t object_no, uint64_t object_off,
+                       uint64_t object_len, const ::SnapContext &snapc,
+                       bool disable_clone_remove, bool update_object_map,
+                       const ZTracer::Trace &parent_trace, Context *completion)
+    : AbstractObjectWriteRequest<ImageCtxT>(ictx, oid, object_no, object_off,
+                                            object_len, snapc, "discard",
+                                            parent_trace, completion),
+      m_update_object_map(update_object_map) {
+    if (this->m_full_object) {
+      if (disable_clone_remove && this->has_parent()) {
+        // need to hide the parent object instead of child object
+        m_discard_action = DISCARD_ACTION_REMOVE_TRUNCATE;
+        this->m_object_len = 0;
+      } else {
+        m_discard_action = DISCARD_ACTION_REMOVE;
+      }
+    } else if (object_off + object_len == ictx->layout.object_size) {
+      m_discard_action = DISCARD_ACTION_TRUNCATE;
+    } else {
+      m_discard_action = DISCARD_ACTION_ZERO;
+    }
   }
 
   const char* get_op_type() const override {
-    if (has_parent()) {
-      return "remove (trunc)";
+    switch (m_discard_action) {
+    case DISCARD_ACTION_REMOVE:
+      return "remove";
+    case DISCARD_ACTION_REMOVE_TRUNCATE:
+      return "remove (truncate)";
+    case DISCARD_ACTION_TRUNCATE:
+      return "truncate";
+    case DISCARD_ACTION_ZERO:
+      return "zero";
     }
-    return "remove";
+    assert(false);
+    return nullptr;
   }
 
-  bool pre_object_map_update(uint8_t *new_state) override {
-    if (has_parent()) {
-      m_object_state = OBJECT_EXISTS;
-    } else {
-      m_object_state = OBJECT_PENDING;
+  uint8_t get_pre_write_object_map_state() const override {
+    if (m_discard_action == DISCARD_ACTION_REMOVE) {
+      return OBJECT_PENDING;
     }
-    *new_state = m_object_state;
-    return true;
+    return OBJECT_EXISTS;
   }
-
-  bool post_object_map_update() override {
-    if (m_object_state == OBJECT_EXISTS) {
-      return false;
-    }
-    return true;
-  }
-
-  void guard_write() override;
-  void send_write() override;
 
 protected:
+  bool is_no_op_for_nonexistent_object() const override {
+    return (!this->has_parent());
+  }
+  bool is_object_map_update_enabled() const override {
+    return m_update_object_map;
+  }
+  bool is_non_existent_post_write_object_map_state() const override {
+    return (m_discard_action == DISCARD_ACTION_REMOVE);
+  }
+
+  void add_write_hint(librados::ObjectWriteOperation *wr) override {
+    // no hint for discard
+  }
+
   void add_write_ops(librados::ObjectWriteOperation *wr) override {
-    if (has_parent()) {
-      wr->truncate(0);
-    } else {
+    switch (m_discard_action) {
+    case DISCARD_ACTION_REMOVE:
       wr->remove();
+      break;
+    case DISCARD_ACTION_REMOVE_TRUNCATE:
+    case DISCARD_ACTION_TRUNCATE:
+      wr->truncate(this->m_object_off);
+      break;
+    case DISCARD_ACTION_ZERO:
+      wr->zero(this->m_object_off, this->m_object_len);
+      break;
+    default:
+      assert(false);
+      break;
     }
   }
 
 private:
-  uint8_t m_object_state;
+  enum DiscardAction {
+    DISCARD_ACTION_REMOVE,
+    DISCARD_ACTION_REMOVE_TRUNCATE,
+    DISCARD_ACTION_TRUNCATE,
+    DISCARD_ACTION_ZERO
+  };
+
+  DiscardAction m_discard_action;
+  bool m_update_object_map;
+
 };
 
-class ObjectTrimRequest : public AbstractObjectWriteRequest {
+template <typename ImageCtxT = ImageCtx>
+class ObjectWriteSameRequest : public AbstractObjectWriteRequest<ImageCtxT> {
 public:
-  // we'd need to only conditionally specify if a post object map
-  // update is needed. pre update is decided as usual (by checking
-  // the state of the object in the map).
-  ObjectTrimRequest(ImageCtx *ictx, const std::string &oid, uint64_t object_no,
-                    const ::SnapContext &snapc, Context *completion,
-                    bool post_object_map_update)
-    : AbstractObjectWriteRequest(ictx, oid, object_no, 0, 0, snapc, completion,
-                                 true),
-      m_post_object_map_update(post_object_map_update) {
-  }
-
-  const char* get_op_type() const override {
-    return "remove (trim)";
-  }
-
-  bool pre_object_map_update(uint8_t *new_state) override {
-    *new_state = OBJECT_PENDING;
-    return true;
-  }
-
-  bool post_object_map_update() override {
-    return m_post_object_map_update;
-  }
-
-protected:
-  void add_write_ops(librados::ObjectWriteOperation *wr) override {
-    wr->remove();
-  }
-
-private:
-  bool m_post_object_map_update;
-};
-
-class ObjectTruncateRequest : public AbstractObjectWriteRequest {
-public:
-  ObjectTruncateRequest(ImageCtx *ictx, const std::string &oid,
-                        uint64_t object_no, uint64_t object_off,
-                        const ::SnapContext &snapc, Context *completion)
-    : AbstractObjectWriteRequest(ictx, oid, object_no, object_off, 0, snapc,
-                                 completion, true) {
-  }
-
-  const char* get_op_type() const override {
-    return "truncate";
-  }
-
-  bool pre_object_map_update(uint8_t *new_state) override {
-    if (!m_object_exist && !has_parent())
-      *new_state = OBJECT_NONEXISTENT;
-    else
-      *new_state = OBJECT_EXISTS;
-    return true;
-  }
-
-  void send_write() override;
-
-protected:
-  void add_write_ops(librados::ObjectWriteOperation *wr) override {
-    wr->truncate(m_object_off);
-  }
-};
-
-class ObjectZeroRequest : public AbstractObjectWriteRequest {
-public:
-  ObjectZeroRequest(ImageCtx *ictx, const std::string &oid, uint64_t object_no,
-                    uint64_t object_off, uint64_t object_len,
-                    const ::SnapContext &snapc, Context *completion)
-    : AbstractObjectWriteRequest(ictx, oid, object_no, object_off, object_len,
-                                 snapc, completion, true) {
-  }
-
-  const char* get_op_type() const override {
-    return "zero";
-  }
-
-  bool pre_object_map_update(uint8_t *new_state) override {
-    *new_state = OBJECT_EXISTS;
-    return true;
-  }
-
-protected:
-  void add_write_ops(librados::ObjectWriteOperation *wr) override {
-    wr->zero(m_object_off, m_object_len);
-  }
-};
-
-class ObjectWriteSameRequest : public AbstractObjectWriteRequest {
-public:
-  ObjectWriteSameRequest(ImageCtx *ictx, const std::string &oid, uint64_t object_no,
-                         uint64_t object_off, uint64_t object_len,
-                         const ceph::bufferlist &data,
-                         const ::SnapContext &snapc, Context *completion,
-                         int op_flags)
-    : AbstractObjectWriteRequest(ictx, oid, object_no, object_off,
-                                 object_len, snapc, completion, false),
+  ObjectWriteSameRequest(ImageCtxT *ictx, const std::string &oid,
+			 uint64_t object_no, uint64_t object_off,
+			 uint64_t object_len, const ceph::bufferlist &data,
+                         const ::SnapContext &snapc, int op_flags,
+			 const ZTracer::Trace &parent_trace,
+			 Context *completion)
+    : AbstractObjectWriteRequest<ImageCtxT>(ictx, oid, object_no, object_off,
+                                            object_len, snapc, "writesame",
+                                            parent_trace, completion),
       m_write_data(data), m_op_flags(op_flags) {
   }
 
@@ -474,18 +448,54 @@ public:
     return "writesame";
   }
 
-  bool pre_object_map_update(uint8_t *new_state) override {
-    *new_state = OBJECT_EXISTS;
-    return true;
-  }
-
 protected:
   void add_write_ops(librados::ObjectWriteOperation *wr) override;
 
-  void send_write() override;
-
 private:
   ceph::bufferlist m_write_data;
+  int m_op_flags;
+};
+
+template <typename ImageCtxT = ImageCtx>
+class ObjectCompareAndWriteRequest : public AbstractObjectWriteRequest<ImageCtxT> {
+public:
+  ObjectCompareAndWriteRequest(ImageCtxT *ictx, const std::string &oid,
+                               uint64_t object_no, uint64_t object_off,
+                               const ceph::bufferlist &cmp_bl,
+                               const ceph::bufferlist &write_bl,
+                               const ::SnapContext &snapc,
+                               uint64_t *mismatch_offset, int op_flags,
+                               const ZTracer::Trace &parent_trace,
+                               Context *completion)
+   : AbstractObjectWriteRequest<ImageCtxT>(ictx, oid, object_no, object_off,
+                                           cmp_bl.length(), snapc,
+                                           "compare_and_write", parent_trace,
+                                           completion),
+    m_cmp_bl(cmp_bl), m_write_bl(write_bl),
+    m_mismatch_offset(mismatch_offset), m_op_flags(op_flags) {
+  }
+
+  const char *get_op_type() const override {
+    return "compare_and_write";
+  }
+
+  void add_copyup_ops(librados::ObjectWriteOperation *wr) override {
+    // no-op on copyup
+  }
+
+protected:
+  virtual bool is_post_copyup_write_required() const {
+    return true;
+  }
+
+  void add_write_ops(librados::ObjectWriteOperation *wr) override;
+
+  int filter_write_result(int r) const override;
+
+private:
+  ceph::bufferlist m_cmp_bl;
+  ceph::bufferlist m_write_bl;
+  uint64_t *m_mismatch_offset;
   int m_op_flags;
 };
 
@@ -494,5 +504,10 @@ private:
 
 extern template class librbd::io::ObjectRequest<librbd::ImageCtx>;
 extern template class librbd::io::ObjectReadRequest<librbd::ImageCtx>;
+extern template class librbd::io::AbstractObjectWriteRequest<librbd::ImageCtx>;
+extern template class librbd::io::ObjectWriteRequest<librbd::ImageCtx>;
+extern template class librbd::io::ObjectDiscardRequest<librbd::ImageCtx>;
+extern template class librbd::io::ObjectWriteSameRequest<librbd::ImageCtx>;
+extern template class librbd::io::ObjectCompareAndWriteRequest<librbd::ImageCtx>;
 
 #endif // CEPH_LIBRBD_IO_OBJECT_REQUEST_H

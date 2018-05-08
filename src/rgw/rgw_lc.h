@@ -12,6 +12,7 @@
 #include "include/rados/librados.hpp"
 #include "common/Mutex.h"
 #include "common/Cond.h"
+#include "common/iso_8601.h"
 #include "common/Thread.h"
 #include "rgw_common.h"
 #include "rgw_rados.h"
@@ -20,7 +21,6 @@
 
 #include <atomic>
 
-using namespace std;
 #define HASH_PRIME 7877
 #define MAX_ID_LEN 255
 static string lc_oid_prefix = "lc";
@@ -39,29 +39,98 @@ class LCExpiration
 {
 protected:
   string days;
+  //At present only current object has expiration date
+  string date;
 public:
   LCExpiration() {}
   ~LCExpiration() {}
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(2, 2, bl);
+    ENCODE_START(3, 2, bl);
     ::encode(days, bl);
+    ::encode(date, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator& bl) {
-    DECODE_START_LEGACY_COMPAT_LEN(2, 2, 2, bl);
+    DECODE_START_LEGACY_COMPAT_LEN(3, 2, 2, bl);
     ::decode(days, bl);
+    if (struct_v >= 3) {
+      ::decode(date, bl);
+    }
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
 //  static void generate_test_instances(list<ACLOwner*>& o);
   void set_days(const string& _days) { days = _days; }
-  int get_days() {return atoi(days.c_str()); }
-  bool empty() const{
-    return days.empty();
+  string get_days_str() const {
+    return days;
+  }
+  int get_days() const {return atoi(days.c_str()); }
+  bool has_days() const {
+    return !days.empty();
+  }
+  void set_date(const string& _date) { date = _date; }
+  string get_date() const {
+    return date;
+  }
+  bool has_date() const {
+    return !date.empty();
+  }
+  bool empty() const {
+    return days.empty() && date.empty();
+  }
+  bool valid() const {
+    if (!days.empty() && !date.empty()) {
+      return false;
+    } else if (!days.empty() && get_days() <= 0) {
+      return false;
+    }
+    //We've checked date in xml parsing
+    return true;
   }
 };
 WRITE_CLASS_ENCODER(LCExpiration)
+
+class LCFilter
+{
+ protected:
+  std::string prefix;
+  // TODO add support for tagging
+ public:
+  const std::string& get_prefix() const{
+    return prefix;
+  }
+
+  void set_prefix(const string& _prefix){
+    prefix = _prefix;
+  }
+
+  void set_prefix(std::string&& _prefix){
+    prefix = std::move(_prefix);
+  }
+
+  bool empty() const {
+    return prefix.empty();
+  }
+
+  bool has_prefix() const {
+    return !prefix.empty();
+  }
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    ::encode(prefix, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator& bl) {
+    DECODE_START(1, bl);
+    ::decode(prefix, bl);
+    DECODE_FINISH(bl);
+  }
+};
+WRITE_CLASS_ENCODER(LCFilter);
+
+
 
 class LCRule
 {
@@ -72,6 +141,8 @@ protected:
   LCExpiration expiration;
   LCExpiration noncur_expiration;
   LCExpiration mp_expiration;
+  LCFilter filter;
+  bool dm_expiration = false;
 
 public:
 
@@ -86,9 +157,13 @@ public:
   string& get_status() {
       return status;
   }
-  
+
   string& get_prefix() {
       return prefix;
+  }
+
+  LCFilter& get_filter() {
+    return filter;
   }
 
   LCExpiration& get_expiration() {
@@ -101,6 +176,10 @@ public:
 
   LCExpiration& get_mp_expiration() {
     return mp_expiration;
+  }
+
+  bool get_dm_expiration() {
+    return dm_expiration;
   }
 
   void set_id(string*_id) {
@@ -127,20 +206,26 @@ public:
     mp_expiration = *_mp_expiration;
   }
 
-  bool validate();
+  void set_dm_expiration(bool _dm_expiration) {
+    dm_expiration = _dm_expiration;
+  }
+
+  bool valid();
   
   void encode(bufferlist& bl) const {
-     ENCODE_START(3, 1, bl);
+     ENCODE_START(5, 1, bl);
      ::encode(id, bl);
      ::encode(prefix, bl);
      ::encode(status, bl);
      ::encode(expiration, bl);
      ::encode(noncur_expiration, bl);
      ::encode(mp_expiration, bl);
+     ::encode(dm_expiration, bl);
+     ::encode(filter, bl);
      ENCODE_FINISH(bl);
    }
    void decode(bufferlist::iterator& bl) {
-     DECODE_START_LEGACY_COMPAT_LEN(3, 1, 1, bl);
+     DECODE_START_LEGACY_COMPAT_LEN(5, 1, 1, bl);
      ::decode(id, bl);
      ::decode(prefix, bl);
      ::decode(status, bl);
@@ -151,6 +236,12 @@ public:
      if (struct_v >= 3) {
        ::decode(mp_expiration, bl);
      }
+     if (struct_v >= 4) {
+        ::decode(dm_expiration, bl);
+     }
+     if (struct_v >= 5) {
+       ::decode(filter, bl);
+     }
      DECODE_FINISH(bl);
    }
 
@@ -160,11 +251,13 @@ WRITE_CLASS_ENCODER(LCRule)
 struct lc_op
 {
   bool status;
+  bool dm_expiration;
   int expiration;
   int noncur_expiration;
   int mp_expiration;
+  boost::optional<ceph::real_time> expiration_date;
 
-  lc_op() : status(false), expiration(0), noncur_expiration(0), mp_expiration(0) {}
+  lc_op() : status(false), dm_expiration(false), expiration(0), noncur_expiration(0), mp_expiration(0) {}
   
 };
 
@@ -175,6 +268,7 @@ protected:
   map<string, lc_op> prefix_map;
   multimap<string, LCRule> rule_map;
   bool _add_rule(LCRule *rule);
+  bool has_same_action(const lc_op& first, const lc_op& second);
 public:
   RGWLifecycleConfiguration(CephContext *_cct) : cct(_cct) {}
   RGWLifecycleConfiguration() : cct(NULL) {}
@@ -209,7 +303,7 @@ public:
 
   int check_and_add_rule(LCRule* rule);
 
-  bool validate();
+  bool valid();
 
   multimap<string, LCRule>& get_rule_map() { return rule_map; }
   map<string, lc_op>& get_prefix_map() { return prefix_map; }
@@ -226,8 +320,8 @@ WRITE_CLASS_ENCODER(RGWLifecycleConfiguration)
 class RGWLC {
   CephContext *cct;
   RGWRados *store;
-  int max_objs;
-  string *obj_names;
+  int max_objs{0};
+  string *obj_names{nullptr};
   std::atomic<bool> down_flag = { false };
   string cookie;
 

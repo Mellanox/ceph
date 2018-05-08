@@ -29,6 +29,9 @@
 
 #include "common/ceph_context.h"
 
+// reinclude our assert to clobber the system one
+# include "include/assert.h"
+
 class PerfCounters;
 
 enum {
@@ -180,6 +183,11 @@ public:
   }
 
   void close() override;
+
+  PerfCounters *get_perf_counters() override
+  {
+    return logger;
+  }
 
   class LevelDBTransactionImpl : public KeyValueDB::TransactionImpl {
   public:

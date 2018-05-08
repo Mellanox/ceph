@@ -87,7 +87,7 @@ run_expect_nosignal "$RADOS_TOOL" --object_locator "asdf" ls
 run_expect_nosignal "$RADOS_TOOL" --namespace "asdf" ls
 
 run_expect_succ "$RADOS_TOOL" mkpool "$POOL"
-run_expect_succ "$CEPH_TOOL" osd erasure-code-profile set myprofile k=2 m=1 stripe_unit=2K ruleset-failure-domain=osd --force
+run_expect_succ "$CEPH_TOOL" osd erasure-code-profile set myprofile k=2 m=1 stripe_unit=2K crush-failure-domain=osd --force
 run_expect_succ "$CEPH_TOOL" osd pool create "$POOL_EC" 100 100 erasure myprofile
 
 
@@ -346,7 +346,7 @@ test_rmobj() {
     $CEPH_TOOL osd pool set-quota $p max_objects 1
     V1=`mktemp fooattrXXXXXXX`
     $RADOS_TOOL put $OBJ $V1 -p $p
-    while ! $CEPH_TOOL osd dump | grep 'full max_objects'
+    while ! $CEPH_TOOL osd dump | grep 'full_no_quota max_objects'
     do
 	sleep 2
     done

@@ -19,9 +19,54 @@ if test $(id -u) != 0 ; then
 fi
 export LC_ALL=C # the following is vulnerable to i18n
 
+function munge_ceph_spec_in {
+    local OUTFILE=$1
+    sed -e 's/@//g' -e 's/%bcond_with make_check/%bcond_without make_check/g' < ceph.spec.in > $OUTFILE
+}
+
+function ensure_decent_gcc_on_deb {
+    # point gcc to the one offered by distro if the used one is different
+    local old=$(gcc -dumpversion)
+    local new=$1
+    if dpkg --compare-versions $old eq $new; then
+	    return
+    fi
+
+    case $old in
+        4*)
+            old=4.8;;
+        5*)
+            old=5;;
+        7*)
+            old=7;;
+    esac
+
+    cat <<EOF
+/usr/bin/gcc now points to gcc-$old, which is not the version shipped with the
+distro: gcc-$new. Reverting...
+EOF
+
+    $SUDO update-alternatives --remove-all gcc || true
+    $SUDO update-alternatives \
+	 --install /usr/bin/gcc gcc /usr/bin/gcc-${new} 20 \
+	 --slave   /usr/bin/g++ g++ /usr/bin/g++-${new}
+
+    $SUDO update-alternatives \
+	 --install /usr/bin/gcc gcc /usr/bin/gcc-${old} 10 \
+	 --slave   /usr/bin/g++ g++ /usr/bin/g++-${old}
+
+    $SUDO update-alternatives --auto gcc
+
+    # cmake uses the latter by default
+    $SUDO ln -nsf /usr/bin/gcc /usr/bin/x86_64-linux-gnu-gcc
+    $SUDO ln -nsf /usr/bin/g++ /usr/bin/x86_64-linux-gnu-g++
+}
+
 if [ x`uname`x = xFreeBSDx ]; then
     $SUDO pkg install -yq \
+        devel/babeltrace \
         devel/git \
+        devel/gperf \
         devel/gmake \
         devel/cmake \
         devel/yasm \
@@ -29,35 +74,41 @@ if [ x`uname`x = xFreeBSDx ]; then
         devel/boost-python-libs \
         devel/valgrind \
         devel/pkgconf \
-        devel/libatomic_ops \
         devel/libedit \
         devel/libtool \
         devel/google-perftools \
         lang/cython \
         devel/py-virtualenv \
         databases/leveldb \
-	net/openldap24-client \
+        net/openldap-client \
         security/nss \
         security/cryptopp \
         archivers/snappy \
         ftp/curl \
         misc/e2fsprogs-libuuid \
         misc/getopt \
+        net/socat \
         textproc/expat2 \
         textproc/gsed \
         textproc/libxml2 \
         textproc/xmlstarlet \
-	textproc/jq \
-	textproc/sphinx \
+        textproc/jq \
+        textproc/py-sphinx \
         emulators/fuse \
         java/junit \
+        lang/python \
         lang/python27 \
+        devel/py-pip \
         devel/py-argparse \
         devel/py-nose \
+        devel/py-prettytable \
         www/py-flask \
         www/fcgi \
         sysutils/flock \
         sysutils/fusefs-libs \
+
+	# Now use pip to install some extra python modules
+	pip install pecan
 
     exit
 else
@@ -67,6 +118,14 @@ else
         echo "Using apt-get to install dependencies"
         $SUDO apt-get install -y lsb-release devscripts equivs
         $SUDO apt-get install -y dpkg-dev gcc
+        case "$VERSION" in
+            *Trusty*)
+                ensure_decent_gcc_on_deb 4.8
+                ;;
+            *Xenial*)
+                ensure_decent_gcc_on_deb 5
+                ;;
+        esac
         if ! test -r debian/control ; then
             echo debian/control is not a readable file
             exit 1
@@ -124,14 +183,14 @@ else
                 fi
                 ;;
         esac
-        sed -e 's/@//g' < ceph.spec.in > $DIR/ceph.spec
+        munge_ceph_spec_in $DIR/ceph.spec
         $SUDO $builddepcmd $DIR/ceph.spec 2>&1 | tee $DIR/yum-builddep.out
         ! grep -q -i error: $DIR/yum-builddep.out || exit 1
         ;;
     opensuse|suse|sles)
         echo "Using zypper to install dependencies"
         $SUDO zypper --gpg-auto-import-keys --non-interactive install lsb-release systemd-rpm-macros
-        sed -e 's/@//g' < ceph.spec.in > $DIR/ceph.spec
+        munge_ceph_spec_in $DIR/ceph.spec
         $SUDO zypper --non-interactive install $(rpmspec -q --buildrequires $DIR/ceph.spec) || exit 1
         ;;
     alpine)
@@ -159,7 +218,8 @@ function populate_wheelhouse() {
 
     # although pip comes with virtualenv, having a recent version
     # of pip matters when it comes to using wheel packages
-    pip --timeout 300 $install 'setuptools >= 0.8' 'pip >= 7.0' 'wheel >= 0.24' || return 1
+    # workaround of https://github.com/pypa/setuptools/issues/1042
+    pip --timeout 300 $install 'setuptools >= 0.8,< 36' 'pip >= 7.0' 'wheel >= 0.24' || return 1
     if test $# != 0 ; then
         pip --timeout 300 $install $@ || return 1
     fi

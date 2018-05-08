@@ -217,6 +217,7 @@ void ECBackend::_failed_push(const hobject_t &hoid,
   dout(10) << __func__ << ": canceling recovery op for obj " << hoid
 	   << dendl;
   assert(recovery_ops.count(hoid));
+  eversion_t v = recovery_ops[hoid].v;
   recovery_ops.erase(hoid);
 
   list<pg_shard_t> fl;
@@ -224,6 +225,8 @@ void ECBackend::_failed_push(const hobject_t &hoid,
     fl.push_back(i.first);
   }
   get_parent()->failed_push(fl, hoid);
+  get_parent()->backfill_add_missing(hoid, v);
+  get_parent()->finish_degraded_object(hoid);
 }
 
 struct OnRecoveryReadComplete :
@@ -352,12 +355,14 @@ void ECBackend::handle_recovery_push(
 	op.soid,
 	op.recovery_info,
 	recovery_ops[op.soid].obc,
+	false,
 	&m->t);
     } else {
       get_parent()->on_local_recover(
 	op.soid,
 	op.recovery_info,
 	ObjectContextRef(),
+	false,
 	&m->t);
     }
   }
@@ -650,7 +655,7 @@ void ECBackend::continue_recovery_op(
 	  stat.num_bytes_recovered = op.recovery_info.size;
 	  stat.num_keys_recovered = 0; // ??? op ... omap_entries.size(); ?
 	  stat.num_objects_recovered = 1;
-	  get_parent()->on_global_recover(op.hoid, stat);
+	  get_parent()->on_global_recover(op.hoid, stat, false);
 	  dout(10) << __func__ << ": WRITING return " << op << dendl;
 	  recovery_ops.erase(op.hoid);
 	  return;
@@ -685,11 +690,13 @@ void ECBackend::run_recovery_op(
     RecoveryOp &op = recovery_ops.insert(make_pair(i->hoid, *i)).first->second;
     continue_recovery_op(op, &m);
   }
+
   dispatch_recovery_messages(m, priority);
+  send_recovery_deletes(priority, h->deletes);
   delete _h;
 }
 
-void ECBackend::recover_object(
+int ECBackend::recover_object(
   const hobject_t &hoid,
   eversion_t v,
   ObjectContextRef head,
@@ -730,6 +737,7 @@ void ECBackend::recover_object(
     }
   }
   dout(10) << __func__ << ": built op " << h->ops.back() << dendl;
+  return 0;
 }
 
 bool ECBackend::can_handle_while_inactive(
@@ -738,7 +746,7 @@ bool ECBackend::can_handle_while_inactive(
   return false;
 }
 
-bool ECBackend::handle_message(
+bool ECBackend::_handle_message(
   OpRequestRef _op)
 {
   dout(10) << __func__ << ": " << *_op->get_req() << dendl;
@@ -991,7 +999,8 @@ void ECBackend::handle_sub_read(
       hinfo = get_hash_info(i->first);
       if (!hinfo) {
 	r = -EIO;
-	get_parent()->clog_error() << __func__ << ": No hinfo for " << i->first;
+	get_parent()->clog_error() << "Corruption detected: object " << i->first
+                                   << " is missing hash_info";
 	dout(5) << __func__ << ": No hinfo for " << i->first << dendl;
 	goto error;
       }
@@ -1003,12 +1012,10 @@ void ECBackend::handle_sub_read(
 	ghobject_t(i->first, ghobject_t::NO_GEN, shard),
 	j->get<0>(),
 	j->get<1>(),
-	bl, j->get<2>(),
-	true); // Allow EIO return
+	bl, j->get<2>());
       if (r < 0) {
-	get_parent()->clog_error() << __func__
-				   << ": Error " << r
-				   << " reading "
+	get_parent()->clog_error() << "Error " << r
+				   << " reading object "
 				   << i->first;
 	dout(5) << __func__ << ": Error " << r
 		<< " reading " << i->first << dendl;
@@ -1034,7 +1041,7 @@ void ECBackend::handle_sub_read(
 	  bufferhash h(-1);
 	  h << bl;
 	  if (h.digest() != hinfo->get_chunk_hash(shard)) {
-	    get_parent()->clog_error() << __func__ << ": Bad hash for " << i->first << " digest 0x"
+	    get_parent()->clog_error() << "Bad hash for " << i->first << " digest 0x"
 				       << hex << h.digest() << " expected 0x" << hinfo->get_chunk_hash(shard) << dec;
 	    dout(5) << __func__ << ": Bad hash for " << i->first << " digest 0x"
 		    << hex << h.digest() << " expected 0x" << hinfo->get_chunk_hash(shard) << dec << dendl;
@@ -1183,8 +1190,7 @@ void ECBackend::handle_sub_read_reply(
   unsigned is_complete = 0;
   // For redundant reads check for completion as each shard comes in,
   // or in a non-recovery read check for completion once all the shards read.
-  // TODO: It would be nice if recovery could send more reads too
-  if (rop.do_redundant_reads || (!rop.for_recovery && rop.in_progress.empty())) {
+  if (rop.do_redundant_reads || rop.in_progress.empty()) {
     for (map<hobject_t, read_result_t>::const_iterator iter =
         rop.complete.begin();
       iter != rop.complete.end();
@@ -1213,13 +1219,11 @@ void ECBackend::handle_sub_read_reply(
 	    }
 	    // Couldn't read any additional shards so handle as completed with errors
 	  }
-	  if (rop.complete[iter->first].errors.empty()) {
-	    dout(20) << __func__ << " simply not enough copies err=" << err << dendl;
-	  } else {
-	    // Grab the first error
-	    err = rop.complete[iter->first].errors.begin()->second;
-	    dout(20) << __func__ << ": Use one of the shard errors err=" << err << dendl;
-	  }
+	  // We don't want to confuse clients / RBD with objectstore error
+	  // values in particular ENOENT.  We may have different error returns
+	  // from different shards, so we'll return minimum_to_decode() error
+	  // (usually EIO) to reader.  It is likely an error here is due to a
+	  // damaged pg.
 	  rop.complete[iter->first].r = err;
 	  ++is_complete;
 	}
@@ -1231,7 +1235,7 @@ void ECBackend::handle_sub_read_reply(
 	    err = rop.complete[iter->first].errors.begin()->second;
             rop.complete[iter->first].r = err;
 	  } else {
-	    get_parent()->clog_error() << __func__ << ": Error(s) ignored for "
+	    get_parent()->clog_warn() << "Error(s) ignored for "
 				       << iter->first << " enough copies available";
 	    dout(10) << __func__ << " Error(s) ignored for " << iter->first
 		     << " enough copies available" << dendl;
@@ -1483,19 +1487,12 @@ void ECBackend::call_write_ordered(std::function<void(void)> &&cb) {
   }
 }
 
-int ECBackend::get_min_avail_to_read_shards(
+void ECBackend::get_all_avail_shards(
   const hobject_t &hoid,
-  const set<int> &want,
-  bool for_recovery,
-  bool do_redundant_reads,
-  set<pg_shard_t> *to_read)
+  set<int> &have,
+  map<shard_id_t, pg_shard_t> &shards,
+  bool for_recovery)
 {
-  // Make sure we don't do redundant reads for recovery
-  assert(!for_recovery || !do_redundant_reads);
-
-  set<int> have;
-  map<shard_id_t, pg_shard_t> shards;
-
   for (set<pg_shard_t>::const_iterator i =
 	 get_parent()->get_acting_shards().begin();
        i != get_parent()->get_acting_shards().end();
@@ -1546,6 +1543,22 @@ int ECBackend::get_min_avail_to_read_shards(
       }
     }
   }
+}
+
+int ECBackend::get_min_avail_to_read_shards(
+  const hobject_t &hoid,
+  const set<int> &want,
+  bool for_recovery,
+  bool do_redundant_reads,
+  set<pg_shard_t> *to_read)
+{
+  // Make sure we don't do redundant reads for recovery
+  assert(!for_recovery || !do_redundant_reads);
+
+  set<int> have;
+  map<shard_id_t, pg_shard_t> shards;
+
+  get_all_avail_shards(hoid, have, shards, for_recovery);
 
   set<int> need;
   int r = ec_impl->minimum_to_decode(want, have, &need);
@@ -1571,30 +1584,18 @@ int ECBackend::get_min_avail_to_read_shards(
 int ECBackend::get_remaining_shards(
   const hobject_t &hoid,
   const set<int> &avail,
-  set<pg_shard_t> *to_read)
+  set<pg_shard_t> *to_read,
+  bool for_recovery)
 {
-  set<int> need;
+  assert(to_read);
+
+  set<int> have;
   map<shard_id_t, pg_shard_t> shards;
 
-  for (set<pg_shard_t>::const_iterator i =
-	 get_parent()->get_acting_shards().begin();
-       i != get_parent()->get_acting_shards().end();
-       ++i) {
-    dout(10) << __func__ << ": checking acting " << *i << dendl;
-    const pg_missing_t &missing = get_parent()->get_shard_missing(*i);
-    if (!missing.is_missing(hoid)) {
-      assert(!need.count(i->shard));
-      need.insert(i->shard);
-      assert(!shards.count(i->shard));
-      shards.insert(make_pair(i->shard, *i));
-    }
-  }
+  get_all_avail_shards(hoid, have, shards, for_recovery);
 
-  if (!to_read)
-    return 0;
-
-  for (set<int>::iterator i = need.begin();
-       i != need.end();
+  for (set<int>::iterator i = have.begin();
+       i != have.end();
        ++i) {
     assert(shards.count(shard_id_t(*i)));
     if (avail.find(*i) == avail.end())
@@ -1898,7 +1899,7 @@ bool ECBackend::try_reads_to_commit()
       op->plan,
       ec_impl,
       get_parent()->get_info().pgid.pgid,
-      !get_osdmap()->test_flag(CEPH_OSDMAP_REQUIRE_KRAKEN),
+      (get_osdmap()->require_osd_release < CEPH_RELEASE_KRAKEN),
       sinfo,
       op->remote_read_result,
       op->log_entries,
@@ -2030,7 +2031,7 @@ bool ECBackend::try_finish_rmw()
   if (op->version > committed_to)
     committed_to = op->version;
 
-  if (get_osdmap()->test_flag(CEPH_OSDMAP_REQUIRE_KRAKEN)) {
+  if (get_osdmap()->require_osd_release >= CEPH_RELEASE_KRAKEN) {
     if (op->version > get_parent()->get_log().get_can_rollback_to() &&
 	waiting_reads.empty() &&
 	waiting_commit.empty()) {
@@ -2316,7 +2317,7 @@ int ECBackend::send_all_remaining_reads(
     already_read.insert(i->shard);
   dout(10) << __func__ << " have/error shards=" << already_read << dendl;
   set<pg_shard_t> shards;
-  int r = get_remaining_shards(hoid, already_read, &shards);
+  int r = get_remaining_shards(hoid, already_read, &shards, rop.for_recovery);
   if (r)
     return r;
   if (shards.empty())
@@ -2403,7 +2404,7 @@ void ECBackend::be_deep_scrub(
 	poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
       pos,
       stride, bl,
-      fadvise_flags, true);
+      fadvise_flags);
     if (r < 0)
       break;
     if (bl.length() % sinfo.get_chunk_size()) {

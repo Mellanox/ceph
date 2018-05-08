@@ -94,8 +94,8 @@ Pool specific commands
 :command:`get` *name* *outfile*
   Read object name from the cluster and write it to outfile.
 
-:command:`put` *name* *infile*
-  Write object name to the cluster with contents from infile.
+:command:`put` *name* *infile* [--offset offset]
+  Write object name with start offset (default:0) to the cluster with contents from infile.
 
 :command:`append` *name* *infile*
   Append object name to the cluster with contents from infile.
@@ -136,7 +136,21 @@ Pool specific commands
   Note: *write* and *seq* must be run on the same host otherwise the
   objects created by *write* will have names that will fail *seq*.
 
-:command:`cleanup`
+:command:`cleanup` [ --run-name *run_name* ] [ --prefix *prefix* ]
+  Clean up a previous benchmark operation.
+  Note: the default run-name is "benchmark_last_metadata"
+
+:command:`listxattr` *name*
+  List all extended attributes of an object.
+
+:command:`getxattr` *name* *attr*
+  Dump the extended attribute value of *attr* of an object.
+
+:command:`setxattr` *name* *attr* *value*
+  Set the value of *attr* in the extended attributes of an object.
+
+:command:`rmxattr` *name* *attr*
+  Remove *attr* from the extended attributes of an object.
 
 :command:`listomapkeys` *name*
   List all the keys stored in the object map of object name.
@@ -147,12 +161,12 @@ Pool specific commands
 
 :command:`getomapval` [ --omap-key-file *file* ] *name* *key* [ *out-file* ]
   Dump the hexadecimal value of key in the object map of object name.
-  If the optional *out-file* argument isn't provided, the value will be
+  If the optional *out-file* argument is not provided, the value will be
   written to standard output.
 
 :command:`setomapval` [ --omap-key-file *file* ] *name* *key* [ *value* ]
   Set the value of key in the object map of object name. If the optional
-  *value* argument isn't provided, the value will be read from standard
+  *value* argument is not provided, the value will be read from standard
   input.
 
 :command:`rmomapkey` [ --omap-key-file *file* ] *name* *key*

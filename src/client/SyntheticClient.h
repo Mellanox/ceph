@@ -95,9 +95,10 @@
 
 
 void parse_syn_options(vector<const char*>& args);
+extern int num_client;
 
 class SyntheticClient {
-  Client *client;
+  StandaloneClient *client;
   int whoami;
 
   pthread_t thread_id;
@@ -168,7 +169,7 @@ class SyntheticClient {
   }
 
  public:
-  SyntheticClient(Client *client, int w = -1);
+  SyntheticClient(StandaloneClient *client, int w = -1);
 
   int start_thread();
   int join_thread();

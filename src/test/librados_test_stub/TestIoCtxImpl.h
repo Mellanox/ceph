@@ -4,12 +4,14 @@
 #ifndef CEPH_TEST_IO_CTX_IMPL_H
 #define CEPH_TEST_IO_CTX_IMPL_H
 
+#include <list>
+#include <atomic>
+
+#include <boost/function.hpp>
+
 #include "include/rados/librados.hpp"
-#include "include/atomic.h"
 #include "include/Context.h"
 #include "common/snap_types.h"
-#include <boost/function.hpp>
-#include <list>
 
 namespace librados {
 
@@ -30,7 +32,7 @@ public:
 
   ObjectOperations ops;
 private:
-  atomic_t m_refcount;
+  std::atomic<uint64_t> m_refcount = { 0 };
 };
 
 class TestIoCtxImpl {
@@ -105,6 +107,12 @@ public:
                             const std::string &filter_prefix,
                             uint64_t max_return,
                             std::map<std::string, bufferlist> *out_vals) = 0;
+  virtual int omap_get_vals2(const std::string& oid,
+                            const std::string& start_after,
+                            const std::string &filter_prefix,
+                            uint64_t max_return,
+                            std::map<std::string, bufferlist> *out_vals,
+                            bool *pmore) = 0;
   virtual int omap_rm_keys(const std::string& oid,
                            const std::set<std::string>& keys) = 0;
   virtual int omap_set(const std::string& oid,
@@ -127,7 +135,8 @@ public:
                                              std::vector<snap_t>& snaps);
   virtual int set_alloc_hint(const std::string& oid,
                              uint64_t expected_object_size,
-                             uint64_t expected_write_size);
+                             uint64_t expected_write_size,
+                             const SnapContext &snapc);
   virtual void set_snap_read(snap_t seq);
   virtual int sparse_read(const std::string& oid, uint64_t off, uint64_t len,
                           std::map<uint64_t,uint64_t> *m,
@@ -145,11 +154,13 @@ public:
                          const SnapContext &snapc) = 0;
   virtual int writesame(const std::string& oid, bufferlist& bl, size_t len,
                         uint64_t off, const SnapContext &snapc) = 0;
+  virtual int cmpext(const std::string& oid, uint64_t off, bufferlist& cmp_bl) = 0;
   virtual int xattr_get(const std::string& oid,
                         std::map<std::string, bufferlist>* attrset) = 0;
   virtual int xattr_set(const std::string& oid, const std::string &name,
                         bufferlist& bl) = 0;
-  virtual int zero(const std::string& oid, uint64_t off, uint64_t len) = 0;
+  virtual int zero(const std::string& oid, uint64_t off, uint64_t len,
+                   const SnapContext &snapc) = 0;
 
   int execute_operation(const std::string& oid,
                         const Operation &operation);
@@ -179,8 +190,8 @@ private:
   std::string m_pool_name;
   snap_t m_snap_seq;
   SnapContext m_snapc;
-  atomic_t m_refcount;
-  atomic_t m_pending_ops;
+  std::atomic<uint64_t> m_refcount = { 0 };
+  std::atomic<uint64_t> m_pending_ops = { 0 };
 
   void handle_aio_notify_complete(AioCompletionImpl *aio_comp, int r);
 };

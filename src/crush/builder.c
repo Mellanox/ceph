@@ -1,15 +1,12 @@
 #include <string.h>
-#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
 #include <errno.h>
 
-#include "include/int_types.h"
-
+#include "crush/crush.h"
 #include "builder.h"
-#include "hash.h"
 
 #define dprintk(args...) /* printf(args) */
 
@@ -1033,12 +1030,11 @@ int crush_remove_straw_bucket_item(struct crush_map *map,
 
 	for (i = 0; i < bucket->h.size; i++) {
 		if (bucket->h.items[i] == item) {
-			bucket->h.size--;
 			if (bucket->item_weights[i] < bucket->h.weight)
 				bucket->h.weight -= bucket->item_weights[i];
 			else
 				bucket->h.weight = 0;
-			for (j = i; j < bucket->h.size; j++) {
+			for (j = i; j < bucket->h.size - 1; j++) {
 				bucket->h.items[j] = bucket->h.items[j+1];
 				bucket->item_weights[j] = bucket->item_weights[j+1];
 			}
@@ -1047,7 +1043,11 @@ int crush_remove_straw_bucket_item(struct crush_map *map,
 	}
 	if (i == bucket->h.size)
 		return -ENOENT;
-	
+	bucket->h.size--;
+	if (bucket->h.size == 0) {
+		/* don't bother reallocating */
+		return 0;
+	}
 	void *_realloc = NULL;
 
 	if ((_realloc = realloc(bucket->h.items, sizeof(__s32)*newsize)) == NULL) {
@@ -1077,12 +1077,11 @@ int crush_remove_straw2_bucket_item(struct crush_map *map,
 
 	for (i = 0; i < bucket->h.size; i++) {
 		if (bucket->h.items[i] == item) {
-			bucket->h.size--;
 			if (bucket->item_weights[i] < bucket->h.weight)
 				bucket->h.weight -= bucket->item_weights[i];
 			else
 				bucket->h.weight = 0;
-			for (j = i; j < bucket->h.size; j++) {
+			for (j = i; j < bucket->h.size - 1; j++) {
 				bucket->h.items[j] = bucket->h.items[j+1];
 				bucket->item_weights[j] = bucket->item_weights[j+1];
 			}
@@ -1091,6 +1090,12 @@ int crush_remove_straw2_bucket_item(struct crush_map *map,
 	}
 	if (i == bucket->h.size)
 		return -ENOENT;
+
+	bucket->h.size--;
+	if (!newsize) {
+		/* don't bother reallocating a 0-length array. */
+		return 0;
+	}
 
 	void *_realloc = NULL;
 
@@ -1416,13 +1421,13 @@ struct crush_choose_arg *crush_make_choose_args(struct crush_map *map, int num_p
   int size = (sizeof(struct crush_choose_arg) * map->max_buckets +
               sizeof(struct crush_weight_set) * bucket_count * num_positions +
               sizeof(__u32) * sum_bucket_size * num_positions + // weights
-              sizeof(__u32) * sum_bucket_size); // ids
+              sizeof(__s32) * sum_bucket_size); // ids
   char *space = malloc(size);
   struct crush_choose_arg *arg = (struct crush_choose_arg *)space;
   struct crush_weight_set *weight_set = (struct crush_weight_set *)(arg + map->max_buckets);
   __u32 *weights = (__u32 *)(weight_set + bucket_count * num_positions);
   char *weight_set_ends = (char*)weights;
-  int *ids = (int *)(weights + sum_bucket_size * num_positions);
+  __s32 *ids = (__s32 *)(weights + sum_bucket_size * num_positions);
   char *weights_end = (char *)ids;
   char *ids_end = (char *)(ids + sum_bucket_size);
   BUG_ON(space + size != ids_end);
@@ -1445,7 +1450,7 @@ struct crush_choose_arg *crush_make_choose_args(struct crush_map *map, int num_p
     arg[b].weight_set_size = num_positions;
     weight_set += position;
 
-    memcpy(ids, bucket->h.items, sizeof(int) * bucket->h.size);
+    memcpy(ids, bucket->h.items, sizeof(__s32) * bucket->h.size);
     arg[b].ids = ids;
     arg[b].ids_size = bucket->h.size;
     ids += bucket->h.size;

@@ -218,8 +218,13 @@ static void log_usage(struct req_state *s, const string& op_name)
   rgw_usage_data data(bytes_sent, bytes_received);
 
   data.ops = 1;
-  if (!error)
+  if (!s->is_err())
     data.successful_ops = 1;
+
+  ldout(s->cct, 30) << "log_usage: bucket_name=" << bucket_name
+	<< " tenant=" << s->bucket_tenant
+	<< ", bytes_sent=" << bytes_sent << ", bytes_received="
+	<< bytes_received << ", success=" << data.successful_ops << dendl;
 
   entry.add(op_name, data);
 
@@ -327,7 +332,7 @@ int rgw_log_op(RGWRados *store, RGWREST* const rest, struct req_state *s,
   }
   rgw_make_bucket_entry_name(s->bucket_tenant, s->bucket_name, entry.bucket);
 
-  if (check_utf8(s->bucket_name.c_str(), entry.bucket.size()) != 0) {
+  if (check_utf8(entry.bucket.c_str(), entry.bucket.size()) != 0) {
     ldout(s->cct, 5) << "not logging op on bucket with non-utf8 name" << dendl;
     return 0;
   }
@@ -346,8 +351,28 @@ int rgw_log_op(RGWRados *store, RGWREST* const rest, struct req_state *s,
   else
     set_param_str(s, "REMOTE_ADDR", entry.remote_addr);
   set_param_str(s, "HTTP_USER_AGENT", entry.user_agent);
-  set_param_str(s, "HTTP_REFERRER", entry.referrer);
-  set_param_str(s, "REQUEST_URI", entry.uri);
+  // legacy apps are still using misspelling referer, such as curl -e option
+  if (s->info.env->exists("HTTP_REFERRER"))
+    set_param_str(s, "HTTP_REFERRER", entry.referrer);
+  else
+    set_param_str(s, "HTTP_REFERER", entry.referrer);
+
+  std::string uri(s->info.env->get("REQUEST_METHOD"));
+  uri.append(" ");
+
+  uri.append(s->info.env->get("REQUEST_URI"));
+  const char* qs = s->info.env->get("QUERY_STRING");
+  if(qs && (*qs != '\0')) {
+    uri.append("?");
+    uri.append(qs);
+  }
+
+  uri.append(" ");
+  uri.append("HTTP/");
+  uri.append(s->info.env->get("HTTP_VERSION"));
+
+  entry.uri = std::move(uri);
+
   set_param_str(s, "REQUEST_METHOD", entry.op);
 
   /* custom header logging */
@@ -381,7 +406,7 @@ int rgw_log_op(RGWRados *store, RGWREST* const rest, struct req_state *s,
   } else
     entry.http_status = "200"; // default
 
-  entry.error_code = s->err.s3_code;
+  entry.error_code = s->err.err_code;
   entry.bucket_id = bucket_id;
 
   bufferlist bl;

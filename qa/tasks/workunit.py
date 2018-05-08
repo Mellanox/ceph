@@ -4,6 +4,7 @@ Workunit task -- Run ceph on sets of specific clients
 import logging
 import pipes
 import os
+import re
 
 from copy import deepcopy
 from util import get_remote_for_role
@@ -121,6 +122,17 @@ def task(ctx, config):
               backup.client.0: [foo]
               client.1: [bar] # cluster is implicitly 'ceph'
 
+    You can also specify an alternative top-level dir to 'qa/workunits', like
+    'qa/standalone', with::
+
+        tasks:
+        - install:
+        - workunit:
+            basedir: qa/standalone
+            clients:
+              client.0:
+                - test-ceph-helpers.sh
+
     :param ctx: Context
     :param config: Configuration
     """
@@ -173,7 +185,9 @@ def task(ctx, config):
         for role, tests in clients.iteritems():
             if role != "all":
                 p.spawn(_run_tests, ctx, refspec, role, tests,
-                        config.get('env'), timeout=timeout)
+                        config.get('env'),
+                        basedir=config.get('basedir','qa/workunits'),
+                        timeout=timeout)
 
     # Clean up dirs from any non-all workunits
     for role, created in created_mountpoint.items():
@@ -183,6 +197,7 @@ def task(ctx, config):
     if 'all' in clients:
         all_tasks = clients["all"]
         _spawn_on_all_clients(ctx, refspec, all_tasks, config.get('env'),
+                              config.get('basedir', 'qa/workunits'),
                               config.get('subdir'), timeout=timeout)
 
 
@@ -311,7 +326,7 @@ def _make_scratch_dir(ctx, role, subdir):
     return created_mountpoint
 
 
-def _spawn_on_all_clients(ctx, refspec, tests, env, subdir, timeout=None):
+def _spawn_on_all_clients(ctx, refspec, tests, env, basedir, subdir, timeout=None):
     """
     Make a scratch directory for each client in the cluster, and then for each
     test spawn _run_tests() for each role.
@@ -330,7 +345,9 @@ def _spawn_on_all_clients(ctx, refspec, tests, env, subdir, timeout=None):
     for unit in tests:
         with parallel() as p:
             for role, remote in client_remotes.items():
-                p.spawn(_run_tests, ctx, refspec, role, [unit], env, subdir,
+                p.spawn(_run_tests, ctx, refspec, role, [unit], env,
+                        basedir,
+                        subdir,
                         timeout=timeout)
 
     # cleanup the generated client directories
@@ -338,7 +355,8 @@ def _spawn_on_all_clients(ctx, refspec, tests, env, subdir, timeout=None):
         _delete_dir(ctx, role, created_mountpoint[role])
 
 
-def _run_tests(ctx, refspec, role, tests, env, subdir=None, timeout=None):
+def _run_tests(ctx, refspec, role, tests, env, basedir,
+               subdir=None, timeout=None):
     """
     Run the individual test. Create a scratch directory and then extract the
     workunits from git. Make the executables, and then run the tests.
@@ -368,7 +386,8 @@ def _run_tests(ctx, refspec, role, tests, env, subdir=None, timeout=None):
     else:
         scratch_tmp = os.path.join(mnt, subdir)
     clonedir = '{tdir}/clone.{role}'.format(tdir=testdir, role=role)
-    srcdir = '{cdir}/qa/workunits'.format(cdir=clonedir)
+    srcdir = '{cdir}/{basedir}'.format(cdir=clonedir,
+                                       basedir=basedir)
 
     git_url = teuth_config.get_ceph_qa_suite_git_url()
     # if we are running an upgrade test, and ceph-ci does not have branches like
@@ -377,9 +396,12 @@ def _run_tests(ctx, refspec, role, tests, env, subdir=None, timeout=None):
         remote.run(logger=log.getChild(role),
                    args=refspec.clone(git_url, clonedir))
     except CommandFailedError:
-        if not git_url.endswith('/ceph-ci.git'):
+        if git_url.endswith('/ceph-ci.git'):
+            alt_git_url = git_url.replace('/ceph-ci.git', '/ceph.git')
+        elif git_url.endswith('/ceph-ci'):
+            alt_git_url = re.sub(r'/ceph-ci$', '/ceph.git', git_url)
+        else:
             raise
-        alt_git_url = git_url.replace('/ceph-ci.git', '/ceph.git')
         log.info(
             "failed to check out '%s' from %s; will also try in %s",
             refspec,
@@ -426,6 +448,7 @@ def _run_tests(ctx, refspec, role, tests, env, subdir=None, timeout=None):
                     run.Raw('CEPH_ID="{id}"'.format(id=id_)),
                     run.Raw('PATH=$PATH:/usr/sbin'),
                     run.Raw('CEPH_BASE={dir}'.format(dir=clonedir)),
+                    run.Raw('CEPH_ROOT={dir}'.format(dir=clonedir)),
                 ]
                 if env is not None:
                     for var, val in env.iteritems():

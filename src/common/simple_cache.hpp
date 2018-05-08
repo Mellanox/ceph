@@ -15,11 +15,7 @@
 #ifndef CEPH_SIMPLECACHE_H
 #define CEPH_SIMPLECACHE_H
 
-#include <map>
-#include <list>
-#include <memory>
 #include "common/Mutex.h"
-#include "common/Cond.h"
 #include "include/unordered_map.h"
 
 template <class K, class V, class C = std::less<K>, class H = std::hash<K> >
@@ -31,7 +27,7 @@ class SimpleLRU {
   map<K, V, C> pinned;
 
   void trim_cache() {
-    while (lru.size() > max_size) {
+    while (contents.size() > max_size) {
       contents.erase(lru.back().first);
       lru.pop_back();
     }

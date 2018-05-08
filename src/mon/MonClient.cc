@@ -14,6 +14,8 @@
 
 #include <random>
 
+#include "include/scope_guard.h"
+
 #include "messages/MMonGetMap.h"
 #include "messages/MMonGetVersion.h"
 #include "messages/MMonGetVersionReply.h"
@@ -39,7 +41,6 @@
 #include "auth/AuthMethodList.h"
 #include "auth/RotatingKeyRing.h"
 
-
 #define dout_subsys ceph_subsys_monc
 #undef dout_prefix
 #define dout_prefix *_dout << "monclient" << (_hunting() ? "(hunting)":"") << ": "
@@ -48,14 +49,16 @@ MonClient::MonClient(CephContext *cct_) :
   Dispatcher(cct_),
   messenger(NULL),
   monc_lock("MonClient::monc_lock"),
-  timer(cct_, monc_lock), finisher(cct_),
+  timer(cct_, monc_lock),
+  finisher(cct_),
   initialized(false),
   no_keyring_disabled_cephx(false),
   log_client(NULL),
   more_log_pending(false),
   want_monmap(true),
   had_a_connection(false),
-  reopen_interval_multiplier(1.0),
+  reopen_interval_multiplier(
+    cct_->_conf->get_val<double>("mon_client_hunt_interval_min_multiple")),
   last_mon_command_tid(0),
   version_req_id(0)
 {
@@ -267,6 +270,11 @@ bool MonClient::ms_dispatch(Message *m)
   switch (m->get_type()) {
   case CEPH_MSG_MON_MAP:
     handle_monmap(static_cast<MMonMap*>(m));
+    if (passthrough_monmap) {
+      return false;
+    } else {
+      m->put();
+    }
     break;
   case CEPH_MSG_AUTH_REPLY:
     handle_auth(static_cast<MAuthReply*>(m));
@@ -311,6 +319,8 @@ void MonClient::flush_log()
   send_log();
 }
 
+/* Unlike all the other message-handling functions, we don't put away a reference
+* because we want to support MMonMap passthrough to other Dispatchers. */
 void MonClient::handle_monmap(MMonMap *m)
 {
   ldout(cct, 10) << __func__ << " " << *m << dendl;
@@ -337,8 +347,6 @@ void MonClient::handle_monmap(MMonMap *m)
 
   map_cond.Signal();
   want_monmap = false;
-
-  m->put();
 }
 
 // ----------------------
@@ -358,7 +366,8 @@ int MonClient::init()
     method = cct->_conf->auth_supported;
   else if (entity_name.get_type() == CEPH_ENTITY_TYPE_OSD ||
 	   entity_name.get_type() == CEPH_ENTITY_TYPE_MDS ||
-	   entity_name.get_type() == CEPH_ENTITY_TYPE_MON)
+	   entity_name.get_type() == CEPH_ENTITY_TYPE_MON ||
+	   entity_name.get_type() == CEPH_ENTITY_TYPE_MGR)
     method = cct->_conf->auth_cluster_required;
   else
     method = cct->_conf->auth_client_required;
@@ -408,7 +417,10 @@ void MonClient::shutdown()
     delete version_requests.begin()->second;
     version_requests.erase(version_requests.begin());
   }
-
+  while (!mon_commands.empty()) {
+    auto tid = mon_commands.begin()->first;
+    _cancel_mon_command(tid);
+  }
   while (!waiting_for_session.empty()) {
     ldout(cct, 20) << __func__ << " discarding pending message " << *waiting_for_session.front() << dendl;
     waiting_for_session.front()->put();
@@ -631,18 +643,24 @@ MonConnection& MonClient::_add_conn(unsigned rank, uint64_t global_id)
 
 void MonClient::_add_conns(uint64_t global_id)
 {
-  const unsigned num_mons = monmap.size();
-  vector<unsigned> ranks(num_mons);
-  for (unsigned i = 0; i < num_mons; i++) {
-    ranks[i] = i;
+  uint16_t min_priority = std::numeric_limits<uint16_t>::max();
+  for (const auto& m : monmap.mon_info) {
+    if (m.second.priority < min_priority) {
+      min_priority = m.second.priority;
+    }
+  }
+  vector<unsigned> ranks;
+  for (const auto& m : monmap.mon_info) {
+    if (m.second.priority == min_priority) {
+      ranks.push_back(monmap.get_rank(m.first));
+    }
   }
   std::random_device rd;
   std::mt19937 rng(rd());
   std::shuffle(ranks.begin(), ranks.end(), rng);
-
   unsigned n = cct->_conf->mon_client_hunt_parallel;
-  if (n == 0 || n > monmap.size()) {
-     n = num_mons;
+  if (n == 0 || n > ranks.size()) {
+    n = ranks.size();
   }
   for (unsigned i = 0; i < n; i++) {
     _add_conn(ranks[i], global_id);
@@ -715,20 +733,22 @@ void MonClient::_finish_hunting()
   }
 
   had_a_connection = true;
-  reopen_interval_multiplier /= 2.0;
-  if (reopen_interval_multiplier < 1.0)
-    reopen_interval_multiplier = 1.0;
+  _un_backoff();
 }
 
 void MonClient::tick()
 {
   ldout(cct, 10) << __func__ << dendl;
 
+  auto reschedule_tick = make_scope_guard([this] {
+      schedule_tick();
+    });
+
   _check_auth_tickets();
   
   if (_hunting()) {
     ldout(cct, 1) << "continuing hunt" << dendl;
-    _reopen_session();
+    return _reopen_session();
   } else if (active_con) {
     // just renew as needed
     utime_t now = ceph_clock_now();
@@ -751,14 +771,24 @@ void MonClient::tick()
       if (interval > cct->_conf->mon_client_ping_timeout) {
 	ldout(cct, 1) << "no keepalive since " << lk << " (" << interval
 		      << " seconds), reconnecting" << dendl;
-	_reopen_session();
+	return _reopen_session();
       }
-
       send_log();
     }
-  }
 
-  schedule_tick();
+    _un_backoff();
+  }
+}
+
+void MonClient::_un_backoff()
+{
+  // un-backoff our reconnect interval
+  reopen_interval_multiplier = std::max(
+    cct->_conf->get_val<double>("mon_client_hunt_interval_min_multiple"),
+    reopen_interval_multiplier /
+    cct->_conf->get_val<double>("mon_client_hunt_interval_backoff"));
+  ldout(cct, 20) << __func__ << " reopen_interval_multipler now "
+		 << reopen_interval_multiplier << dendl;
 }
 
 void MonClient::schedule_tick()
@@ -1003,7 +1033,7 @@ void MonClient::handle_mon_command_ack(MMonCommandAck *ack)
   ack->put();
 }
 
-int MonClient::_cancel_mon_command(uint64_t tid, int r)
+int MonClient::_cancel_mon_command(uint64_t tid)
 {
   assert(monc_lock.is_locked());
 
@@ -1053,7 +1083,7 @@ void MonClient::start_mon_command(const vector<string>& cmd,
       public:
       C_CancelMonCommand(uint64_t tid, MonClient *monc) : tid(tid), monc(monc) {}
       void finish(int r) override {
-	monc->_cancel_mon_command(tid, -ETIMEDOUT);
+	monc->_cancel_mon_command(tid);
       }
     };
     r->ontimeout = new C_CancelMonCommand(r->tid, this);

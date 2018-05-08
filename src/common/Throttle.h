@@ -4,14 +4,15 @@
 #ifndef CEPH_THROTTLE_H
 #define CEPH_THROTTLE_H
 
-#include "Mutex.h"
-#include "Cond.h"
-#include <list>
 #include <map>
+#include <list>
+#include <chrono>
+#include <atomic>
 #include <iostream>
 #include <condition_variable>
-#include <chrono>
-#include "include/atomic.h"
+#include <stdexcept>
+
+#include "Cond.h"
 #include "include/Context.h"
 
 class CephContext;
@@ -29,10 +30,12 @@ class Throttle {
   CephContext *cct;
   const std::string name;
   PerfCounters *logger;
-  ceph::atomic_t count, max;
+  std::atomic<int64_t> count = { 0 }, max = { 0 };
   Mutex lock;
   list<Cond*> cond;
   const bool use_perf;
+  bool shutting_down = false;
+  Cond shutdown_clear;
 
 public:
   Throttle(CephContext *cct, const std::string& n, int64_t m = 0, bool _use_perf = true);
@@ -41,8 +44,8 @@ public:
 private:
   void _reset_max(int64_t m);
   bool _should_wait(int64_t c) const {
-    int64_t m = max.read();
-    int64_t cur = count.read();
+    int64_t m = max;
+    int64_t cur = count;
     return
       m &&
       ((c <= m && cur + c > m) || // normally stay under max
@@ -57,20 +60,20 @@ public:
    * @returns the number of taken slots
    */
   int64_t get_current() const {
-    return count.read();
+    return count;
   }
 
   /**
    * get the max number of slots
    * @returns the max number of slots
    */
-  int64_t get_max() const { return max.read(); }
+  int64_t get_max() const { return max; }
 
   /**
    * return true if past midpoint
    */
   bool past_midpoint() const {
-    return count.read() >= max.read() / 2;
+    return count >= max / 2;
   }
 
   /**
@@ -259,6 +262,7 @@ private:
   uint64_t m_current;
   int m_ret;
   bool m_ignore_enoent;
+  uint32_t waiters = 0;
 };
 
 
@@ -288,6 +292,7 @@ private:
 class OrderedThrottle {
 public:
   OrderedThrottle(uint64_t max, bool ignore_enoent);
+  ~OrderedThrottle();
 
   C_OrderedThrottle *start_op(Context *on_finish);
   void end_op(int r);
@@ -326,6 +331,7 @@ private:
   TidResult m_tid_result;
 
   void complete_pending_ops();
+  uint32_t waiters = 0;
 };
 
 #endif

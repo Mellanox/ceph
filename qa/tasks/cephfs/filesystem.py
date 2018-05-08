@@ -8,6 +8,7 @@ import time
 import datetime
 import re
 import errno
+import random
 
 from teuthology.exceptions import CommandFailedError
 from teuthology import misc
@@ -225,6 +226,17 @@ class MDSCluster(CephCluster):
         else:
             cb(mds_id)
 
+    def get_config(self, key, service_type=None):
+        """
+        get_config specialization of service_type="mds"
+        """
+        if service_type != "mds":
+            return super(MDSCluster, self).get_config(key, service_type)
+
+        # Some tests stop MDS daemons, don't send commands to a dead one:
+        service_id = random.sample(filter(lambda i: self.mds_daemons[i].running(), self.mds_daemons), 1)[0]
+        return self.json_asok(['config', 'get', key], service_type, service_id)[key]
+
     def mds_stop(self, mds_id=None):
         """
         Stop the MDS daemon process(se).  If it held a rank, that rank
@@ -256,8 +268,8 @@ class MDSCluster(CephCluster):
 
         self._one_or_all(mds_id, _fail_restart)
 
-    def newfs(self, name):
-        return Filesystem(self._ctx, create=name)
+    def newfs(self, name='cephfs', create=True):
+        return Filesystem(self._ctx, name=name, create=create)
 
     def status(self):
         return FSStatus(self.mon_manager)
@@ -345,10 +357,6 @@ class MDSCluster(CephCluster):
     def get_mds_info(self, mds_id):
         return FSStatus(self.mon_manager).get_mds(mds_id)
 
-    def is_full(self):
-        flags = json.loads(self.mon_manager.raw_cluster_cmd("osd", "dump", "--format=json-pretty"))['flags']
-        return 'full' in flags
-
     def is_pool_full(self, pool_name):
         pools = json.loads(self.mon_manager.raw_cluster_cmd("osd", "dump", "--format=json-pretty"))['pools']
         for pool in pools:
@@ -362,30 +370,31 @@ class Filesystem(MDSCluster):
     This object is for driving a CephFS filesystem.  The MDS daemons driven by
     MDSCluster may be shared with other Filesystems.
     """
-    def __init__(self, ctx, fscid=None, create=None):
+    def __init__(self, ctx, fscid=None, name=None, create=False,
+                 ec_profile=None):
         super(Filesystem, self).__init__(ctx)
 
+        self.name = name
+        self.ec_profile = ec_profile
         self.id = None
-        self.name = None
         self.metadata_pool_name = None
+        self.metadata_overlay = False
+        self.data_pool_name = None
         self.data_pools = None
 
         client_list = list(misc.all_roles_of_type(self._ctx.cluster, 'client'))
         self.client_id = client_list[0]
         self.client_remote = list(misc.get_clients(ctx=ctx, roles=["client.{0}".format(self.client_id)]))[0][1]
 
-        if create is not None:
+        if name is not None:
             if fscid is not None:
                 raise RuntimeError("cannot specify fscid when creating fs")
-            if create is True:
-                self.name = 'cephfs'
-            else:
-                self.name = create
-            if not self.legacy_configured():
+            if create and not self.legacy_configured():
                 self.create()
-        elif fscid is not None:
-            self.id = fscid
-        self.getinfo(refresh = True)
+        else:
+            if fscid is not None:
+                self.id = fscid
+                self.getinfo(refresh = True)
 
         # Stash a reference to the first created filesystem on ctx, so
         # that if someone drops to the interactive shell they can easily
@@ -412,6 +421,11 @@ class Filesystem(MDSCluster):
         self.get_pool_names(status = status, refresh = refresh)
         return status
 
+    def set_metadata_overlay(self, overlay):
+        if self.id is not None:
+            raise RuntimeError("cannot specify fscid when configuring overlay")
+        self.metadata_overlay = overlay
+
     def deactivate(self, rank):
         if rank < 0:
             raise RuntimeError("invalid rank")
@@ -424,9 +438,6 @@ class Filesystem(MDSCluster):
 
     def set_allow_dirfrags(self, yes):
         self.mon_manager.raw_cluster_cmd("fs", "set", self.name, "allow_dirfrags", str(yes).lower(), '--yes-i-really-mean-it')
-
-    def set_allow_multimds(self, yes):
-        self.mon_manager.raw_cluster_cmd("fs", "set", self.name, "allow_multimds", str(yes).lower(), '--yes-i-really-mean-it')
 
     def get_pgs_per_fs_pool(self):
         """
@@ -444,7 +455,10 @@ class Filesystem(MDSCluster):
             self.name = "cephfs"
         if self.metadata_pool_name is None:
             self.metadata_pool_name = "{0}_metadata".format(self.name)
-        data_pool_name = "{0}_data".format(self.name)
+        if self.data_pool_name is None:
+            data_pool_name = "{0}_data".format(self.name)
+        else:
+            data_pool_name = self.data_pool_name
 
         log.info("Creating filesystem '{0}'".format(self.name))
 
@@ -452,14 +466,53 @@ class Filesystem(MDSCluster):
 
         self.mon_manager.raw_cluster_cmd('osd', 'pool', 'create',
                                          self.metadata_pool_name, pgs_per_fs_pool.__str__())
-        self.mon_manager.raw_cluster_cmd('osd', 'pool', 'create',
-                                         data_pool_name, pgs_per_fs_pool.__str__())
-        self.mon_manager.raw_cluster_cmd('fs', 'new',
-                                         self.name, self.metadata_pool_name, data_pool_name)
+        if self.metadata_overlay:
+            self.mon_manager.raw_cluster_cmd('fs', 'new',
+                                             self.name, self.metadata_pool_name, data_pool_name,
+                                             '--allow-dangerous-metadata-overlay')
+        else:
+            if self.ec_profile and 'disabled' not in self.ec_profile:
+                log.info("EC profile is %s", self.ec_profile)
+                cmd = ['osd', 'erasure-code-profile', 'set', data_pool_name]
+                cmd.extend(self.ec_profile)
+                self.mon_manager.raw_cluster_cmd(*cmd)
+                self.mon_manager.raw_cluster_cmd(
+                    'osd', 'pool', 'create',
+                    data_pool_name, pgs_per_fs_pool.__str__(), 'erasure',
+                    data_pool_name)
+                self.mon_manager.raw_cluster_cmd(
+                    'osd', 'pool', 'set',
+                    data_pool_name, 'allow_ec_overwrites', 'true')
+            else:
+                self.mon_manager.raw_cluster_cmd(
+                    'osd', 'pool', 'create',
+                    data_pool_name, pgs_per_fs_pool.__str__())
+            self.mon_manager.raw_cluster_cmd('fs', 'new',
+                                             self.name, self.metadata_pool_name, data_pool_name)
+        self.check_pool_application(self.metadata_pool_name)
+        self.check_pool_application(data_pool_name)
         # Turn off spurious standby count warnings from modifying max_mds in tests.
-        self.mon_manager.raw_cluster_cmd('fs', 'set', self.name, 'standby_count_wanted', '0')
+        try:
+            self.mon_manager.raw_cluster_cmd('fs', 'set', self.name, 'standby_count_wanted', '0')
+        except CommandFailedError as e:
+            if e.exitstatus == 22:
+                # standby_count_wanted not available prior to luminous (upgrade tests would fail otherwise)
+                pass
+            else:
+                raise
 
         self.getinfo(refresh = True)
+
+        
+    def check_pool_application(self, pool_name):
+        osd_map = self.mon_manager.get_osd_dump_json()
+        for pool in osd_map['pools']:
+            if pool['pool_name'] == pool_name:
+                if "application_metadata" in pool:
+                    if not "cephfs" in pool['application_metadata']:
+                        raise RuntimeError("Pool %p does not name cephfs as application!".\
+                                           format(pool_name))
+        
 
     def __del__(self):
         if getattr(self._ctx, "filesystem", None) == self:
@@ -547,6 +600,11 @@ class Filesystem(MDSCluster):
 
     def get_metadata_pool_name(self):
         return self.metadata_pool_name
+
+    def set_data_pool_name(self, name):
+        if self.id is not None:
+            raise RuntimeError("can't set filesystem name if its fscid is set")
+        self.data_pool_name = name
 
     def get_namespace_id(self):
         return self.id
@@ -1149,3 +1207,6 @@ class Filesystem(MDSCluster):
             return workers[0].value
         else:
             return None
+
+    def is_full(self):
+        return self.is_pool_full(self.get_data_pool_name())

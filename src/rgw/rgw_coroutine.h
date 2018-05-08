@@ -6,7 +6,6 @@
 #pragma push_macro("_ASSERT_H")
 #endif
 
-#include <boost/asio.hpp>
 #include <boost/intrusive_ptr.hpp>
 
 #ifdef NEED_ASSERT_H
@@ -20,7 +19,7 @@
 #include "common/admin_socket.h"
 
 #include "rgw_common.h"
-#include "rgw_boost_asio_coroutine.h"
+#include <boost/asio/coroutine.hpp>
 
 #include <atomic>
 

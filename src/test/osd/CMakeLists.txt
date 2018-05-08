@@ -17,20 +17,6 @@ install(TARGETS
   ceph_test_rados
   DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# scripts
-add_ceph_test(osd-bench.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-bench.sh) 
-add_ceph_test(osd-config.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-config.sh)
-add_ceph_test(osd-markdown.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-markdown.sh) 
-add_ceph_test(osd-reactivate.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-reactivate.sh) 
-add_ceph_test(osd-reuse-id.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-reuse-id.sh)
-add_ceph_test(osd-scrub-repair.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-scrub-repair.sh) 
-add_ceph_test(osd-scrub-snaps.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-scrub-snaps.sh)
-add_ceph_test(osd-copy-from.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-copy-from.sh)
-add_ceph_test(osd-fast-mark-down.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-fast-mark-down.sh)
-if(HAVE_LIBAIO)
-  add_ceph_test(osd-dup.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-dup.sh)
-endif()
-
 # unittest_osdmap
 add_executable(unittest_osdmap
   TestOSDMap.cc
@@ -64,9 +50,10 @@ target_link_libraries(unittest_osdscrub osd os global ${CMAKE_DL_LIBS} mon ${BLK
 add_executable(unittest_pglog
   TestPGLog.cc
   $<TARGET_OBJECTS:unit-main>
+  $<TARGET_OBJECTS:store_test_fixture>
   )
 add_ceph_unittest(unittest_pglog ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_pglog)
-target_link_libraries(unittest_pglog osd global ${CMAKE_DL_LIBS} ${BLKID_LIBRARIES})
+target_link_libraries(unittest_pglog osd os global ${CMAKE_DL_LIBS} ${BLKID_LIBRARIES})
 
 # unittest_hitset
 add_executable(unittest_hitset
@@ -99,3 +86,32 @@ add_executable(unittest_pg_transaction
 )
 add_ceph_unittest(unittest_pg_transaction ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_pg_transaction)
 target_link_libraries(unittest_pg_transaction osd global ${BLKID_LIBRARIES})
+
+# unittest ECTransaction
+add_executable(unittest_ec_transaction
+  test_ec_transaction.cc
+)
+add_ceph_unittest(unittest_ec_transaction ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_ec_transaction)
+target_link_libraries(unittest_ec_transaction osd global ${BLKID_LIBRARIES})
+
+# unittest_mclock_op_class_queue
+add_executable(unittest_mclock_op_class_queue
+  TestMClockOpClassQueue.cc
+)
+add_ceph_unittest(unittest_mclock_op_class_queue
+  ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_mclock_op_class_queue
+)
+target_link_libraries(unittest_mclock_op_class_queue
+  global osd dmclock
+)
+
+# unittest_mclock_client_queue
+add_executable(unittest_mclock_client_queue
+  TestMClockClientQueue.cc
+)
+add_ceph_unittest(unittest_mclock_client_queue
+  ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_mclock_client_queue
+)
+target_link_libraries(unittest_mclock_client_queue
+  global osd dmclock
+)

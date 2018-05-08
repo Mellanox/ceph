@@ -2255,6 +2255,55 @@ TEST_P(StoreTest, MiscFragmentTests) {
 
 }
 
+TEST_P(StoreTest, ZeroVsObjectSize) {
+  ObjectStore::Sequencer osr("test");
+  int r;
+  coll_t cid;
+  struct stat stat;
+  ghobject_t hoid(hobject_t(sobject_t("foo", CEPH_NOSNAP)));
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    cerr << "Creating collection " << cid << std::endl;
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  bufferlist a;
+  a.append("stuff");
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, hoid, 0, 5, a);
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ASSERT_EQ(0, store->stat(cid, hoid, &stat));
+  ASSERT_EQ(5, stat.st_size);
+  {
+    ObjectStore::Transaction t;
+    t.zero(cid, hoid, 1, 2);
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ASSERT_EQ(0, store->stat(cid, hoid, &stat));
+  ASSERT_EQ(5, stat.st_size);
+  {
+    ObjectStore::Transaction t;
+    t.zero(cid, hoid, 3, 200);
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ASSERT_EQ(0, store->stat(cid, hoid, &stat));
+  ASSERT_EQ(203, stat.st_size);
+  {
+    ObjectStore::Transaction t;
+    t.zero(cid, hoid, 100000, 200);
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ASSERT_EQ(0, store->stat(cid, hoid, &stat));
+  ASSERT_EQ(100200, stat.st_size);
+}
+
 TEST_P(StoreTest, ZeroLengthWrite) {
   ObjectStore::Sequencer osr("test");
   int r;
@@ -2273,6 +2322,34 @@ TEST_P(StoreTest, ZeroLengthWrite) {
     t.write(cid, hoid, 1048576, 0, empty);
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
+  }
+  struct stat stat;
+  r = store->stat(cid, hoid, &stat);
+  ASSERT_EQ(0, r);
+  ASSERT_EQ(0, stat.st_size);
+
+  bufferlist newdata;
+  r = store->read(cid, hoid, 0, 1048576, newdata);
+  ASSERT_EQ(0, r);
+}
+
+TEST_P(StoreTest, ZeroLengthZero) {
+  ObjectStore::Sequencer osr("test");
+  int r;
+  coll_t cid;
+  ghobject_t hoid(hobject_t(sobject_t("foo", CEPH_NOSNAP)));
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    t.touch(cid, hoid);
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(0, r);
+  }
+  {
+    ObjectStore::Transaction t;
+    t.zero(cid, hoid, 1048576, 0);
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(0, r);
   }
   struct stat stat;
   r = store->stat(cid, hoid, &stat);
@@ -2306,6 +2383,7 @@ TEST_P(StoreTest, SimpleAttrTest) {
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
   }
+  osr.flush();
   {
     bool empty;
     int r = store->collection_empty(cid, &empty);
@@ -2325,6 +2403,7 @@ TEST_P(StoreTest, SimpleAttrTest) {
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
   }
+  osr.flush();
   {
     bool empty;
     int r = store->collection_empty(cid, &empty);
@@ -2849,7 +2928,7 @@ TEST_P(StoreTest, SimpleCloneTest) {
     t.remove_collection(cid);
     cerr << "Invalid rm coll" << std::endl;
     PrCtl unset_dumpable;
-    EXPECT_DEATH(apply_transaction(store, &osr, std::move(t)), ".*Directory not empty.*");
+    EXPECT_DEATH(apply_transaction(store, &osr, std::move(t)), "");
   }
   {
     ObjectStore::Transaction t;
@@ -2871,7 +2950,7 @@ TEST_P(StoreTest, SimpleCloneTest) {
     t.remove(cid, hoid2);
     t.remove_collection(cid);
     PrCtl unset_dumpable;
-    EXPECT_DEATH(apply_transaction(store, &osr, std::move(t)), ".*Directory not empty.*");
+    EXPECT_DEATH(apply_transaction(store, &osr, std::move(t)), "");
   }
   {
     ObjectStore::Transaction t;
@@ -3832,16 +3911,18 @@ public:
       len = ROUND_UP_TO(len, write_alignment);
     }
 
-    auto& data = contents[new_obj].data;
-    if (data.length() < offset + len) {
-      data.append_zero(offset+len-data.length());
+    if (len > 0) {
+      auto& data = contents[new_obj].data;
+      if (data.length() < offset + len) {
+	data.append_zero(offset+len-data.length());
+      }
+      bufferlist n;
+      n.substr_of(data, 0, offset);
+      n.append_zero(len);
+      if (data.length() > offset + len)
+	data.copy(offset + len, data.length() - offset - len, n);
+      data.swap(n);
     }
-    bufferlist n;
-    n.substr_of(data, 0, offset);
-    n.append_zero(len);
-    if (data.length() > offset + len)
-      data.copy(offset + len, data.length() - offset - len, n);
-    data.swap(n);
 
     t.zero(cid, new_obj, offset, len);
     ++in_flight;
@@ -4646,7 +4727,8 @@ TEST_P(StoreTest, OMapTest) {
     t.omap_clear(cid, hoid);
     map<string, bufferlist> start_set;
     t.omap_setkeys(cid, hoid, start_set);
-    apply_transaction(store, &osr, std::move(t));
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
   }
 
   for (int i = 0; i < 100; i++) {
@@ -4681,7 +4763,8 @@ TEST_P(StoreTest, OMapTest) {
     to_add.insert(pair<string, bufferlist>("key-" + string(buf), bl));
     attrs.insert(pair<string, bufferlist>("key-" + string(buf), bl));
     t.omap_setkeys(cid, hoid, to_add);
-    apply_transaction(store, &osr, std::move(t));
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
   }
 
   int i = 0;
@@ -4711,7 +4794,8 @@ TEST_P(StoreTest, OMapTest) {
     set<string> keys_to_remove;
     keys_to_remove.insert(to_remove);
     t.omap_rmkeys(cid, hoid, keys_to_remove);
-    apply_transaction(store, &osr, std::move(t));
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
 
     attrs.erase(to_remove);
 
@@ -4723,7 +4807,8 @@ TEST_P(StoreTest, OMapTest) {
     bl1.append("omap_header");
     ObjectStore::Transaction t;
     t.omap_setheader(cid, hoid, bl1);
-    apply_transaction(store, &osr, std::move(t));
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
     t = ObjectStore::Transaction();
  
     bufferlist bl2;
@@ -4731,7 +4816,8 @@ TEST_P(StoreTest, OMapTest) {
     map<string, bufferlist> to_add;
     to_add.insert(pair<string, bufferlist>("key", bl2));
     t.omap_setkeys(cid, hoid, to_add);
-    apply_transaction(store, &osr, std::move(t));
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
 
     bufferlist bl3;
     map<string, bufferlist> cur_attrs;
@@ -4760,12 +4846,14 @@ TEST_P(StoreTest, OMapTest) {
       t.touch(cid, hoid);
       t.omap_setheader(cid, hoid, h);
       t.omap_setkeys(cid, hoid, to_set);
-      apply_transaction(store, &osr, std::move(t));
+      r = apply_transaction(store, &osr, std::move(t));
+      ASSERT_EQ(r, 0);
     }
     {
       ObjectStore::Transaction t;
       t.omap_rmkeyrange(cid, hoid, "3", "7");
-      apply_transaction(store, &osr, std::move(t));
+      r = apply_transaction(store, &osr, std::move(t));
+      ASSERT_EQ(r, 0);
     }
     {
       bufferlist hdr;
@@ -4783,7 +4871,8 @@ TEST_P(StoreTest, OMapTest) {
     {
       ObjectStore::Transaction t;
       t.omap_clear(cid, hoid);
-      apply_transaction(store, &osr, std::move(t));
+      r = apply_transaction(store, &osr, std::move(t));
+      ASSERT_EQ(r, 0);
     }
     {
       bufferlist hdr;
@@ -4821,7 +4910,8 @@ TEST_P(StoreTest, OMapIterator) {
     t.omap_clear(cid, hoid);
     map<string, bufferlist> start_set;
     t.omap_setkeys(cid, hoid, start_set);
-    apply_transaction(store, &osr, std::move(t));
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
   }
   ObjectMap::ObjectMapIterator iter;
   bool correct;
@@ -4864,7 +4954,8 @@ TEST_P(StoreTest, OMapIterator) {
     attrs.insert(pair<string, bufferlist>("key-" + string(buf), bl));
     ObjectStore::Transaction t;
     t.omap_setkeys(cid, hoid, to_add);
-    apply_transaction(store, &osr, std::move(t));
+    r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
   }
 
   iter = store->get_omap_iterator(cid, hoid);
@@ -5734,11 +5825,11 @@ TEST_P(StoreTestSpecificAUSize, TooManyBlobsTest) {
 #if defined(HAVE_LIBAIO)
 void get_mempool_stats(uint64_t* total_bytes, uint64_t* total_items)
 {
-  uint64_t onode_allocated = mempool::bluestore_meta_onode::allocated_bytes();
-  uint64_t other_allocated = mempool::bluestore_meta_other::allocated_bytes();
+  uint64_t onode_allocated = mempool::bluestore_cache_onode::allocated_bytes();
+  uint64_t other_allocated = mempool::bluestore_cache_other::allocated_bytes();
 
-  uint64_t onode_items = mempool::bluestore_meta_onode::allocated_items();
-  uint64_t other_items = mempool::bluestore_meta_other::allocated_items();
+  uint64_t onode_items = mempool::bluestore_cache_onode::allocated_items();
+  uint64_t other_items = mempool::bluestore_cache_other::allocated_items();
   cout << "onode(" << onode_allocated << "/" << onode_items
        << ") other(" << other_allocated << "/" << other_items
        << ")" << std::endl;
@@ -5755,7 +5846,8 @@ TEST_P(StoreTestSpecificAUSize, OnodeSizeTracking) {
   StartDeferred(block_size);
   g_conf->set_val("bluestore_compression_mode", "none");
   g_conf->set_val("bluestore_csum_type", "none");
-  g_conf->set_val("bluestore_cache_size", "400000000");
+  g_conf->set_val("bluestore_cache_size_hdd", "400000000");
+  g_conf->set_val("bluestore_cache_size_ssd", "400000000");
   g_conf->apply_changes(NULL);
 
   ObjectStore::Sequencer osr("test");
@@ -5843,7 +5935,8 @@ TEST_P(StoreTestSpecificAUSize, OnodeSizeTracking) {
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
   }
-  g_ceph_context->_conf->set_val("bluestore_cache_size", "4000000");
+  g_ceph_context->_conf->set_val("bluestore_cache_size_hdd", "4000000");
+  g_ceph_context->_conf->set_val("bluestore_cache_size_ssd", "4000000");
   g_conf->set_val("bluestore_compression_mode", "none");
   g_conf->set_val("bluestore_csum_type", "crc32c");
 
@@ -6324,6 +6417,7 @@ TEST_P(StoreTestSpecificAUSize, SmallWriteOnShardedExtents) {
     t.write(cid, hoid1, 0, bl2.length(), bl2, 0);
     t.zero(cid, hoid1, 0, 0x50000);
     r = apply_transaction(store, &osr, std::move(t));
+    ASSERT_EQ(r, 0);
 
   }
   store->umount();
@@ -6622,6 +6716,42 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
 }
 #endif
 
+TEST_P(StoreTestSpecificAUSize, fsckOnUnalignedDevice) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  g_conf->set_val("bluestore_block_size", stringify(0x280005000)); //10 Gb + 4K
+  g_conf->set_val("bluestore_fsck_on_mount", "false");
+  g_conf->set_val("bluestore_fsck_on_umount", "false");
+  StartDeferred(0x4000);
+  store->umount();
+  ASSERT_EQ(store->fsck(false), 0); // do fsck explicitly
+  store->mount();
+
+  g_conf->set_val("bluestore_fsck_on_mount", "true");
+  g_conf->set_val("bluestore_fsck_on_umount", "true");
+  g_conf->set_val("bluestore_block_size", stringify(0x280000000)); // 10 Gb
+  g_conf->apply_changes(NULL);
+}
+
+TEST_P(StoreTestSpecificAUSize, fsckOnUnalignedDevice2) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  g_conf->set_val("bluestore_block_size", stringify(0x280005000)); //10 Gb + 20K
+  g_conf->set_val("bluestore_fsck_on_mount", "false");
+  g_conf->set_val("bluestore_fsck_on_umount", "false");
+  StartDeferred(0x1000);
+  store->umount();
+  ASSERT_EQ(store->fsck(false), 0); // do fsck explicitly
+  store->mount();
+
+  g_conf->set_val("bluestore_block_size", stringify(0x280000000)); // 10 Gb
+  g_conf->set_val("bluestore_fsck_on_mount", "true");
+  g_conf->set_val("bluestore_fsck_on_umount", "true");
+  g_conf->apply_changes(NULL);
+}
+
 int main(int argc, char **argv) {
   vector<const char*> args;
   argv_to_vec(argc, (const char **)argv, args);
@@ -6645,7 +6775,8 @@ int main(int argc, char **argv) {
   g_ceph_context->_conf->set_val("bluestore_max_alloc_size", "196608");
 
   // set small cache sizes so we see trimming during Synthetic tests
-  g_ceph_context->_conf->set_val("bluestore_cache_size", "4000000");
+  g_ceph_context->_conf->set_val("bluestore_cache_size_hdd", "4000000");
+  g_ceph_context->_conf->set_val("bluestore_cache_size_ssd", "4000000");
 
   // very short *_max prealloc so that we fall back to async submits
   g_ceph_context->_conf->set_val("bluestore_blobid_prealloc", "10");

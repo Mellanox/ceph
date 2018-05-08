@@ -80,9 +80,13 @@ class FlagSetHandler : public FileSystemCommandHandler
 class FsNewHandler : public FileSystemCommandHandler
 {
   public:
-  FsNewHandler()
-    : FileSystemCommandHandler("fs new")
+  FsNewHandler(Paxos *paxos)
+    : FileSystemCommandHandler("fs new"), m_paxos(paxos)
   {
+  }
+
+  bool batched_propose() override {
+    return true;
   }
 
   int handle(
@@ -90,8 +94,10 @@ class FsNewHandler : public FileSystemCommandHandler
       FSMap &fsmap,
       MonOpRequestRef op,
       map<string, cmd_vartype> &cmdmap,
-      std::stringstream &ss)
+      std::stringstream &ss) override
   {
+    assert(m_paxos->is_plugged());
+
     string metadata_name;
     cmd_getval(g_ceph_context, cmdmap, "metadata", metadata_name);
     int64_t metadata = mon->osdmon()->osdmap.lookup_pg_pool_name(metadata_name);
@@ -100,13 +106,17 @@ class FsNewHandler : public FileSystemCommandHandler
       return -ENOENT;
     }
 
-    string force;
-    cmd_getval(g_ceph_context,cmdmap, "force", force);
-    int64_t metadata_num_objects = mon->pgmon()->pg_map.pg_pool_sum[metadata].stats.sum.num_objects;
-    if (force != "--force" && metadata_num_objects > 0) {
-      ss << "pool '" << metadata_name
-	 << "' already contains some objects. Use an empty pool instead.";
-      return -EINVAL;
+    string force_str;
+    cmd_getval(g_ceph_context,cmdmap, "force", force_str);
+    bool force = (force_str == "--force");
+    const pool_stat_t *stat = mon->pgservice->get_pool_stat(metadata);
+    if (stat) {
+      int64_t metadata_num_objects = stat->stats.sum.num_objects;
+      if (!force && metadata_num_objects > 0) {
+	ss << "pool '" << metadata_name
+	   << "' already contains some objects. Use an empty pool instead.";
+	return -EINVAL;
+      }
     }
 
     string data_name;
@@ -120,7 +130,7 @@ class FsNewHandler : public FileSystemCommandHandler
       ss << "pool '" << data_name << "' has id 0, which CephFS does not allow. Use another pool or recreate it to get a non-zero pool id.";
       return -EINVAL;
     }
-   
+
     string fs_name;
     cmd_getval(g_ceph_context, cmdmap, "fs_name", fs_name);
     if (fs_name.empty()) {
@@ -152,9 +162,9 @@ class FsNewHandler : public FileSystemCommandHandler
     }
 
     for (auto fs : fsmap.get_filesystems()) {
-      const set<int64_t>& data_pools = fs->mds_map.get_data_pools();
+      const std::vector<int64_t> &data_pools = fs->mds_map.get_data_pools();
       string sure;
-      if ((data_pools.find(data) != data_pools.end()
+      if ((std::find(data_pools.begin(), data_pools.end(), data) != data_pools.end()
 	   || fs->mds_map.get_metadata_pool() == metadata)
 	  && ((!cmd_getval(g_ceph_context, cmdmap, "sure", sure)
 	       || sure != "--allow-dangerous-metadata-overlay"))) {
@@ -169,19 +179,29 @@ class FsNewHandler : public FileSystemCommandHandler
     pg_pool_t const *metadata_pool = mon->osdmon()->osdmap.get_pg_pool(metadata);
     assert(metadata_pool != NULL);  // Checked it existed above
 
-    // we must make these checks before we even allow ourselves to *think*
-    // about requesting a proposal to the osdmonitor and bail out now if
-    // we believe we must.  bailing out *after* we request the proposal is
-    // bad business as we could have changed the osdmon's state and ending up
-    // returning an error to the user.
-    int r = _check_pool(mon->osdmon()->osdmap, data, false, &ss);
+    int r = _check_pool(mon->osdmon()->osdmap, data, false, force, &ss);
     if (r < 0) {
       return r;
     }
 
-    r = _check_pool(mon->osdmon()->osdmap, metadata, true, &ss);
+    r = _check_pool(mon->osdmon()->osdmap, metadata, true, force, &ss);
     if (r < 0) {
       return r;
+    }
+    
+    // if we're running as luminous, we have to set the pool application metadata
+    if (mon->osdmon()->osdmap.require_osd_release >= CEPH_RELEASE_LUMINOUS ||
+	mon->osdmon()->pending_inc.new_require_osd_release >= CEPH_RELEASE_LUMINOUS) {
+      if (!mon->osdmon()->is_writeable()) {
+	// not allowed to write yet, so retry when we can
+	mon->osdmon()->wait_for_writeable(op, new PaxosService::C_RetryMessage(mon->mdsmon(), op));
+	return -EAGAIN;
+      }
+      mon->osdmon()->do_application_enable(data,
+					   pg_pool_t::APPLICATION_NAME_CEPHFS);
+      mon->osdmon()->do_application_enable(metadata,
+					   pg_pool_t::APPLICATION_NAME_CEPHFS);
+      mon->osdmon()->propose_pending();
     }
 
     // All checks passed, go ahead and create.
@@ -190,6 +210,9 @@ class FsNewHandler : public FileSystemCommandHandler
     ss << "new fs with metadata pool " << metadata << " and data pool " << data;
     return 0;
   }
+
+private:
+  Paxos *m_paxos;
 };
 
 class SetHandler : public FileSystemCommandHandler
@@ -295,10 +318,14 @@ public:
         });
       }
     } else if (var == "balancer") {
-      ss << "setting the metadata load balancer to " << val;
-        fsmap.modify_filesystem(
-            fs->fscid,
-            [val](std::shared_ptr<Filesystem> fs)
+      if (val.empty()) {
+        ss << "unsetting the metadata load balancer";
+      } else {
+        ss << "setting the metadata load balancer to " << val;
+      }
+      fsmap.modify_filesystem(
+	fs->fscid,
+	[val](std::shared_ptr<Filesystem> fs)
         {
           fs->mds_map.set_balancer(val);
         });
@@ -363,12 +390,6 @@ public:
 		});
 	ss << "disallowed increasing the cluster size past 1";
       } else {
-	string confirm;
-	if (!cmd_getval(g_ceph_context, cmdmap, "confirm", confirm) ||
-	    confirm != "--yes-i-really-mean-it") {
-	  ss << EXPERIMENTAL_WARNING;
-	  return -EPERM;
-	}
         fsmap.modify_filesystem(
             fs->fscid,
             [](std::shared_ptr<Filesystem> fs)
@@ -446,9 +467,13 @@ public:
 class AddDataPoolHandler : public FileSystemCommandHandler
 {
   public:
-  AddDataPoolHandler()
-    : FileSystemCommandHandler("fs add_data_pool")
+  AddDataPoolHandler(Paxos *paxos)
+    : FileSystemCommandHandler("fs add_data_pool"), m_paxos(paxos)
   {}
+
+  bool batched_propose() override {
+    return true;
+  }
 
   int handle(
       Monitor *mon,
@@ -457,6 +482,8 @@ class AddDataPoolHandler : public FileSystemCommandHandler
       map<string, cmd_vartype> &cmdmap,
       std::stringstream &ss) override
   {
+    assert(m_paxos->is_plugged());
+
     string poolname;
     cmd_getval(g_ceph_context, cmdmap, "pool", poolname);
 
@@ -483,9 +510,27 @@ class AddDataPoolHandler : public FileSystemCommandHandler
       }
     }
 
-    int r = _check_pool(mon->osdmon()->osdmap, poolid, false, &ss);
+    int r = _check_pool(mon->osdmon()->osdmap, poolid, false, false, &ss);
     if (r != 0) {
       return r;
+    }
+
+    // no-op when the data_pool already on fs
+    if (fs->mds_map.is_data_pool(poolid)) {
+      ss << "data pool " << poolid << " is already on fs " << fs_name;
+      return 0;
+    }
+
+    // if we're running as luminous, we have to set the pool application metadata
+    if (mon->osdmon()->osdmap.require_osd_release >= CEPH_RELEASE_LUMINOUS ||
+	mon->osdmon()->pending_inc.new_require_osd_release >= CEPH_RELEASE_LUMINOUS) {
+      if (!mon->osdmon()->is_writeable()) {
+	// not allowed to write yet, so retry when we can
+	mon->osdmon()->wait_for_writeable(op, new PaxosService::C_RetryMessage(mon->mdsmon(), op));
+	return -EAGAIN;
+      }
+      mon->osdmon()->do_application_enable(poolid, pg_pool_t::APPLICATION_NAME_CEPHFS);
+      mon->osdmon()->propose_pending();
     }
 
     fsmap.modify_filesystem(
@@ -499,6 +544,9 @@ class AddDataPoolHandler : public FileSystemCommandHandler
 
     return 0;
   }
+
+private:
+  Paxos *m_paxos;
 };
 
 class SetDefaultHandler : public FileSystemCommandHandler
@@ -723,8 +771,9 @@ class LegacyHandler : public T
   std::string legacy_prefix;
 
   public:
-  LegacyHandler(const std::string &new_prefix)
-    : T()
+  template <typename... Args>
+  LegacyHandler(const std::string &new_prefix, Args&&... args)
+    : T(std::forward<Args>(args)...)
   {
     legacy_prefix = new_prefix;
   }
@@ -778,22 +827,23 @@ class AliasHandler : public T
 };
 
 
-std::list<std::shared_ptr<FileSystemCommandHandler> > FileSystemCommandHandler::load()
+std::list<std::shared_ptr<FileSystemCommandHandler> >
+FileSystemCommandHandler::load(Paxos *paxos)
 {
   std::list<std::shared_ptr<FileSystemCommandHandler> > handlers;
 
   handlers.push_back(std::make_shared<SetHandler>());
   handlers.push_back(std::make_shared<LegacyHandler<SetHandler> >("mds set"));
   handlers.push_back(std::make_shared<FlagSetHandler>());
-  handlers.push_back(std::make_shared<AddDataPoolHandler>());
+  handlers.push_back(std::make_shared<AddDataPoolHandler>(paxos));
   handlers.push_back(std::make_shared<LegacyHandler<AddDataPoolHandler> >(
-        "mds add_data_pool"));
+        "mds add_data_pool", paxos));
   handlers.push_back(std::make_shared<RemoveDataPoolHandler>());
   handlers.push_back(std::make_shared<LegacyHandler<RemoveDataPoolHandler> >(
         "mds remove_data_pool"));
   handlers.push_back(std::make_shared<LegacyHandler<RemoveDataPoolHandler> >(
         "mds rm_data_pool"));
-  handlers.push_back(std::make_shared<FsNewHandler>());
+  handlers.push_back(std::make_shared<FsNewHandler>(paxos));
   handlers.push_back(std::make_shared<RemoveFilesystemHandler>());
   handlers.push_back(std::make_shared<ResetFilesystemHandler>());
 
@@ -832,6 +882,7 @@ int FileSystemCommandHandler::_check_pool(
     OSDMap &osd_map,
     const int64_t pool_id,
     bool metadata,
+    bool force,
     std::stringstream *ss) const
 {
   assert(ss != NULL);
@@ -876,6 +927,14 @@ int FileSystemCommandHandler::_check_pool(
   if (pool->is_tier()) {
     *ss << " pool '" << pool_name << "' (id '" << pool_id
       << "') is already in use as a cache tier.";
+    return -EINVAL;
+  }
+
+  if (!force && !pool->application_metadata.empty() &&
+      pool->application_metadata.count(
+        pg_pool_t::APPLICATION_NAME_CEPHFS) == 0) {
+    *ss << " pool '" << pool_name << "' (id '" << pool_id
+        << "') has a non-CephFS application enabled.";
     return -EINVAL;
   }
 

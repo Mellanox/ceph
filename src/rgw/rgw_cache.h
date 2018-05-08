@@ -49,16 +49,17 @@ struct ObjectMetaInfo {
 WRITE_CLASS_ENCODER(ObjectMetaInfo)
 
 struct ObjectCacheInfo {
-  int status;
-  uint32_t flags;
-  uint64_t epoch;
+  int status = 0;
+  uint32_t flags = 0;
+  uint64_t epoch = 0;
   bufferlist data;
   map<string, bufferlist> xattrs;
   map<string, bufferlist> rm_xattrs;
   ObjectMetaInfo meta;
-  obj_version version;
+  obj_version version = {};
+  ceph::coarse_mono_time time_added = ceph::coarse_mono_clock::now();
 
-  ObjectCacheInfo() : status(0), flags(0), epoch(0), version() {}
+  ObjectCacheInfo() = default;
 
   void encode(bufferlist& bl) const {
     ENCODE_START(5, 3, bl);
@@ -146,19 +147,42 @@ class ObjectCache {
   list<RGWChainedCache *> chained_cache;
 
   bool enabled;
+  ceph::timespan expiry;
 
-  void touch_lru(string& name, ObjectCacheEntry& entry, std::list<string>::iterator& lru_iter);
-  void remove_lru(string& name, std::list<string>::iterator& lru_iter);
+  void touch_lru(const string& name, ObjectCacheEntry& entry, std::list<string>::iterator& lru_iter);
+  void remove_lru(const string& name, std::list<string>::iterator& lru_iter);
+  void invalidate_lru(ObjectCacheEntry& entry);
 
   void do_invalidate_all();
 public:
   ObjectCache() : lru_size(0), lru_counter(0), lru_window(0), lock("ObjectCache"), cct(NULL), enabled(false) { }
-  int get(std::string& name, ObjectCacheInfo& bl, uint32_t mask, rgw_cache_entry_info *cache_info);
-  void put(std::string& name, ObjectCacheInfo& bl, rgw_cache_entry_info *cache_info);
-  void remove(std::string& name);
+  int get(const std::string& name, ObjectCacheInfo& bl, uint32_t mask, rgw_cache_entry_info *cache_info);
+  boost::optional<ObjectCacheInfo> get(const std::string& name) {
+    boost::optional<ObjectCacheInfo> info{boost::in_place_init};
+    auto r = get(name, *info, 0, nullptr);
+    return r < 0 ? boost::none : info;
+  }
+
+  template<typename F>
+  void for_each(const F& f) {
+    RWLock::RLocker l(lock);
+    if (enabled) {
+      auto now  = ceph::coarse_mono_clock::now();
+      for (const auto& kv : cache_map) {
+        if (expiry.count() && ((now - kv.second.info.time_added) < expiry)) {
+          f(kv.first, kv.second);
+        }
+      }
+    }
+  }
+
+  void put(const std::string& name, ObjectCacheInfo& bl, rgw_cache_entry_info *cache_info);
+  bool remove(const std::string& name);
   void set_ctx(CephContext *_cct) {
     cct = _cct;
     lru_window = cct->_conf->rgw_cache_lru_size / 2;
+    expiry = std::chrono::seconds(cct->_conf->get_val<uint64_t>(
+						"rgw_cache_expiry_interval"));
   }
   bool chain_cache_entry(list<rgw_cache_entry_info *>& cache_info_entries, RGWChainedCache::Entry *chained_entry);
 
@@ -238,7 +262,8 @@ public:
                      RGWObjVersionTracker *objv_tracker, rgw_raw_obj& obj,
                      bufferlist& bl, off_t ofs, off_t end,
                      map<string, bufferlist> *attrs,
-                     rgw_cache_entry_info *cache_info) override;
+                     rgw_cache_entry_info *cache_info,
+		     boost::optional<obj_version> refresh_version = boost::none) override;
 
   int raw_obj_stat(rgw_raw_obj& obj, uint64_t *psize, real_time *pmtime, uint64_t *epoch, map<string, bufferlist> *attrs,
                    bufferlist *first_chunk, RGWObjVersionTracker *objv_tracker) override;
@@ -248,6 +273,11 @@ public:
   bool chain_cache_entry(list<rgw_cache_entry_info *>& cache_info_entries, RGWChainedCache::Entry *chained_entry) override {
     return cache.chain_cache_entry(cache_info_entries, chained_entry);
   }
+  void call_list(const boost::optional<std::string>& filter,
+		 Formatter* format) override;
+  bool call_inspect(const std::string& target, Formatter* format) override;
+  bool call_erase(const std::string& target) override;
+  void call_zap() override;
 };
 
 template <class T>
@@ -283,7 +313,8 @@ int RGWCache<T>::get_system_obj(RGWObjectCtx& obj_ctx, RGWRados::SystemObject::R
                      RGWObjVersionTracker *objv_tracker, rgw_raw_obj& obj,
                      bufferlist& obl, off_t ofs, off_t end,
                      map<string, bufferlist> *attrs,
-                     rgw_cache_entry_info *cache_info)
+		     rgw_cache_entry_info *cache_info,
+		     boost::optional<obj_version> refresh_version)
 {
   rgw_pool pool;
   string oid;
@@ -300,8 +331,9 @@ int RGWCache<T>::get_system_obj(RGWObjectCtx& obj_ctx, RGWRados::SystemObject::R
     flags |= CACHE_FLAG_OBJV;
   if (attrs)
     flags |= CACHE_FLAG_XATTRS;
-  
-  if (cache.get(name, info, flags, cache_info) == 0) {
+
+  if ((cache.get(name, info, flags, cache_info) == 0) &&
+      (!refresh_version || !info.version.compare(&(*refresh_version)))) {
     if (info.status < 0)
       return info.status;
 
@@ -412,9 +444,18 @@ int RGWCache<T>::put_system_obj_impl(rgw_raw_obj& obj, uint64_t size, real_time 
   string name = normal_name(pool, oid);
   if (ret >= 0) {
     cache.put(name, info, NULL);
-    int r = distribute_cache(name, obj, info, UPDATE_OBJ);
-    if (r < 0)
-      mydout(0) << "ERROR: failed to distribute cache for " << obj << dendl;
+    // Only distribute the cache information if we did not just create
+    // the object with the exclusive flag. Note: PUT_OBJ_EXCL implies
+    // PUT_OBJ_CREATE. Generally speaking, when successfully creating
+    // a system object with the exclusive flag it is not necessary to
+    // call distribute_cache, as a) it's unclear whether other RGWs
+    // will need that system object in the near-term and b) it
+    // generates additional network traffic.
+    if (!(flags & PUT_OBJ_EXCL)) {
+      int r = distribute_cache(name, obj, info, UPDATE_OBJ);
+      if (r < 0)
+	mydout(0) << "ERROR: failed to distribute cache for " << obj << dendl;
+    }
   } else {
     cache.remove(name);
   }
@@ -572,4 +613,42 @@ int RGWCache<T>::watch_cb(uint64_t notify_id,
   return 0;
 }
 
+template<typename T>
+void RGWCache<T>::call_list(const boost::optional<std::string>& filter,
+			    Formatter* f)
+{
+  cache.for_each(
+    [this, &filter, f] (const string& name, const ObjectCacheEntry& entry) {
+      if (!filter || name.find(*filter) != name.npos) {
+	T::cache_list_dump_helper(f, name, entry.info.meta.mtime,
+				  entry.info.meta.size);
+      }
+    });
+}
+
+template<typename T>
+bool RGWCache<T>::call_inspect(const std::string& target, Formatter* f)
+{
+  if (const auto entry = cache.get(target)) {
+    f->open_object_section("cache_entry");
+    f->dump_string("name", target.c_str());
+    entry->dump(f);
+    f->close_section();
+    return true;
+  } else {
+    return false;
+  }
+}
+
+template<typename T>
+bool RGWCache<T>::call_erase(const std::string& target)
+{
+  return cache.remove(target);
+}
+
+template<typename T>
+void RGWCache<T>::call_zap()
+{
+  cache.invalidate_all();
+}
 #endif

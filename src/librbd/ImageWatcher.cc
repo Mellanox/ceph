@@ -8,6 +8,7 @@
 #include "librbd/internal.h"
 #include "librbd/Operations.h"
 #include "librbd/TaskFinisher.h"
+#include "librbd/Types.h"
 #include "librbd/Utils.h"
 #include "librbd/exclusive_lock/Policy.h"
 #include "librbd/image_watcher/NotifyLockOwner.h"
@@ -32,6 +33,32 @@ using util::create_rados_callback;
 using librbd::watcher::util::HandlePayloadVisitor;
 
 static const double	RETRY_DELAY_SECONDS = 1.0;
+
+template <typename I>
+struct ImageWatcher<I>::C_ProcessPayload : public Context {
+  ImageWatcher *image_watcher;
+  uint64_t notify_id;
+  uint64_t handle;
+  watch_notify::Payload payload;
+
+  C_ProcessPayload(ImageWatcher *image_watcher_, uint64_t notify_id_,
+                   uint64_t handle_, const watch_notify::Payload &payload)
+    : image_watcher(image_watcher_), notify_id(notify_id_), handle(handle_),
+      payload(payload) {
+  }
+
+  void finish(int r) override {
+    image_watcher->m_async_op_tracker.start_op();
+    if (image_watcher->notifications_blocked()) {
+      // requests are blocked -- just ack the notification
+      bufferlist bl;
+      image_watcher->acknowledge_notify(notify_id, handle, bl);
+    } else {
+      image_watcher->process_payload(notify_id, handle, payload);
+    }
+    image_watcher->m_async_op_tracker.finish_op();
+  }
+};
 
 template <typename I>
 ImageWatcher<I>::ImageWatcher(I &image_ctx)
@@ -60,6 +87,18 @@ void ImageWatcher<I>::unregister_watch(Context *on_finish) {
     m_task_finisher->cancel_all(on_finish);
   });
   Watcher::unregister_watch(ctx);
+}
+
+template <typename I>
+void ImageWatcher<I>::block_notifies(Context *on_finish) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " "  << __func__ << dendl;
+
+  on_finish = new FunctionContext([this, on_finish](int r) {
+      cancel_async_requests();
+      on_finish->complete(r);
+    });
+  Watcher::block_notifies(on_finish);
 }
 
 template <typename I>
@@ -387,7 +426,8 @@ void ImageWatcher<I>::handle_request_lock(int r) {
     schedule_request_lock(true);
   } else {
     // lock owner acked -- but resend if we don't see them release the lock
-    int retry_timeout = m_image_ctx.cct->_conf->client_notify_timeout;
+    int retry_timeout = m_image_ctx.cct->_conf->template get_val<int64_t>(
+      "client_notify_timeout");
     ldout(m_image_ctx.cct, 15) << this << " will retry in " << retry_timeout
                                << " seconds" << dendl;
     schedule_request_lock(true, retry_timeout);
@@ -884,15 +924,9 @@ bool ImageWatcher<I>::handle_payload(const UnknownPayload &payload,
 
 template <typename I>
 void ImageWatcher<I>::process_payload(uint64_t notify_id, uint64_t handle,
-                                      const Payload &payload, int r) {
-  if (r < 0) {
-    bufferlist out_bl;
-    this->acknowledge_notify(notify_id, handle, out_bl);
-  } else {
-    apply_visitor(HandlePayloadVisitor<ImageWatcher<I>>(this, notify_id,
-                                                       handle),
-                  payload);
-  }
+                                      const Payload &payload) {
+  apply_visitor(HandlePayloadVisitor<ImageWatcher<I>>(this, notify_id, handle),
+                payload);
 }
 
 template <typename I>
@@ -919,7 +953,7 @@ void ImageWatcher<I>::handle_notify(uint64_t notify_id, uint64_t handle,
     m_image_ctx.state->refresh(new C_ProcessPayload(this, notify_id, handle,
                                                     notify_message.payload));
   } else {
-    process_payload(notify_id, handle, notify_message.payload, 0);
+    process_payload(notify_id, handle, notify_message.payload);
   }
 }
 

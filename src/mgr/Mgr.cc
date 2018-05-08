@@ -22,14 +22,16 @@
 #include "global/signal_handler.h"
 
 #include "mgr/MgrContext.h"
+#include "mgr/mgr_commands.h"
 
-#include "MgrPyModule.h"
+//#include "MgrPyModule.h"
 #include "DaemonServer.h"
 #include "messages/MMgrBeacon.h"
 #include "messages/MMgrDigest.h"
 #include "messages/MCommand.h"
 #include "messages/MCommandReply.h"
 #include "messages/MLog.h"
+#include "messages/MServiceMap.h"
 
 #include "Mgr.h"
 
@@ -39,7 +41,9 @@
 #define dout_prefix *_dout << "mgr " << __func__ << " "
 
 
-Mgr::Mgr(MonClient *monc_, Messenger *clientm_, Objecter *objecter_,
+Mgr::Mgr(MonClient *monc_, const MgrMap& mgrmap,
+         PyModuleRegistry *py_module_registry_,
+	 Messenger *clientm_, Objecter *objecter_,
 	 Client* client_, LogChannelRef clog_, LogChannelRef audit_clog_) :
   monc(monc_),
   objecter(objecter_),
@@ -48,11 +52,13 @@ Mgr::Mgr(MonClient *monc_, Messenger *clientm_, Objecter *objecter_,
   lock("Mgr::lock"),
   timer(g_ceph_context, lock),
   finisher(g_ceph_context, "Mgr", "mgr-fin"),
-  py_modules(daemon_state, cluster_state, *monc, *objecter, *client,
-             finisher),
-  cluster_state(monc, nullptr),
-  server(monc, finisher, daemon_state, cluster_state, py_modules,
+  digest_received(false),
+  py_module_registry(py_module_registry_),
+  cluster_state(monc, nullptr, mgrmap),
+  server(monc, finisher, daemon_state, cluster_state, *py_module_registry,
          clog_, audit_clog_),
+  clog(clog_),
+  audit_clog(audit_clog_),
   initialized(false),
   initializing(false)
 {
@@ -64,89 +70,74 @@ Mgr::~Mgr()
 {
 }
 
-
-/**
- * Context for completion of metadata mon commands: take
- * the result and stash it in DaemonStateIndex
- */
-class MetadataUpdate : public Context
+void MetadataUpdate::finish(int r)
 {
-  DaemonStateIndex &daemon_state;
-  DaemonKey key;
+  daemon_state.clear_updating(key);
+  if (r == 0) {
+    if (key.first == "mds" || key.first == "osd") {
+      json_spirit::mValue json_result;
+      bool read_ok = json_spirit::read(
+          outbl.to_str(), json_result);
+      if (!read_ok) {
+        dout(1) << "mon returned invalid JSON for "
+                << key.first << "." << key.second << dendl;
+        return;
+      }
+      dout(4) << "mon returned valid metadata JSON for "
+              << key.first << "." << key.second << dendl;
 
-  std::map<std::string, std::string> defaults;
+      json_spirit::mObject daemon_meta = json_result.get_obj();
 
-public:
-  bufferlist outbl;
-  std::string outs;
-
-  MetadataUpdate(DaemonStateIndex &daemon_state_, const DaemonKey &key_)
-    : daemon_state(daemon_state_), key(key_) {}
-
-  void set_default(const std::string &k, const std::string &v)
-  {
-    defaults[k] = v;
-  }
-
-  void finish(int r) override
-  {
-    daemon_state.clear_updating(key);
-    if (r == 0) {
-      if (key.first == CEPH_ENTITY_TYPE_MDS) {
-        json_spirit::mValue json_result;
-        bool read_ok = json_spirit::read(
-            outbl.to_str(), json_result);
-        if (!read_ok) {
-          dout(1) << "mon returned invalid JSON for "
-                  << ceph_entity_type_name(key.first)
-                  << "." << key.second << dendl;
-          return;
+      // Apply any defaults
+      for (const auto &i : defaults) {
+        if (daemon_meta.find(i.first) == daemon_meta.end()) {
+          daemon_meta[i.first] = i.second;
         }
+      }
 
-        json_spirit::mObject daemon_meta = json_result.get_obj();
-
-        // Apply any defaults
-        for (const auto &i : defaults) {
-          if (daemon_meta.find(i.first) == daemon_meta.end()) {
-            daemon_meta[i.first] = i.second;
-          }
-        }
-
-        DaemonStatePtr state;
-        if (daemon_state.exists(key)) {
-          state = daemon_state.get(key);
-          // TODO lock state
+      DaemonStatePtr state;
+      if (daemon_state.exists(key)) {
+        state = daemon_state.get(key);
+	Mutex::Locker l(state->lock);
+        if (key.first == "mds") {
           daemon_meta.erase("name");
-          daemon_meta.erase("hostname");
-          state->metadata.clear();
-          for (const auto &i : daemon_meta) {
-            state->metadata[i.first] = i.second.get_str();
-          }
-        } else {
-          state = std::make_shared<DaemonState>(daemon_state.types);
-          state->key = key;
-          state->hostname = daemon_meta.at("hostname").get_str();
-
-          for (const auto &i : daemon_meta) {
-            state->metadata[i.first] = i.second.get_str();
-          }
-
-          daemon_state.insert(state);
+        } else if (key.first == "osd") {
+          daemon_meta.erase("id");
         }
-      } else if (key.first == CEPH_ENTITY_TYPE_OSD) {
+        daemon_meta.erase("hostname");
+        state->metadata.clear();
+        for (const auto &i : daemon_meta) {
+          state->metadata[i.first] = i.second.get_str();
+        }
       } else {
-        ceph_abort();
+        state = std::make_shared<DaemonState>(daemon_state.types);
+        state->key = key;
+        state->hostname = daemon_meta.at("hostname").get_str();
+
+        if (key.first == "mds") {
+          daemon_meta.erase("name");
+        } else if (key.first == "osd") {
+          daemon_meta.erase("id");
+        }
+        daemon_meta.erase("hostname");
+
+        for (const auto &i : daemon_meta) {
+          state->metadata[i.first] = i.second.get_str();
+        }
+
+        daemon_state.insert(state);
       }
     } else {
-      dout(1) << "mon failed to return metadata for "
-              << ceph_entity_type_name(key.first)
-              << "." << key.second << ": " << cpp_strerror(r) << dendl;
+      ceph_abort();
     }
+  } else {
+    dout(1) << "mon failed to return metadata for "
+            << key.first << "." << key.second << ": "
+	    << cpp_strerror(r) << dendl;
   }
-};
+}
 
-
-void Mgr::background_init()
+void Mgr::background_init(Context *completion)
 {
   Mutex::Locker l(lock);
   assert(!initializing);
@@ -155,8 +146,9 @@ void Mgr::background_init()
 
   finisher.start();
 
-  finisher.queue(new FunctionContext([this](int r){
+  finisher.queue(new FunctionContext([this, completion](int r){
     init();
+    completion->complete(0);
   }));
 }
 
@@ -184,6 +176,7 @@ void Mgr::init()
   monc->sub_want("log-info", 0, 0);
   monc->sub_want("mgrdigest", 0, 0);
   monc->sub_want("fsmap", 0, 0);
+  monc->sub_want("servicemap", 0, 0);
 
   dout(4) << "waiting for OSDMap..." << dendl;
   // Subscribe to OSDMap update to pass on to ClusterState
@@ -215,15 +208,18 @@ void Mgr::init()
   // Preload config keys (`get` for plugins is to be a fast local
   // operation, we we don't have to synchronize these later because
   // all sets will come via mgr)
-  load_config();
+  auto loaded_config = load_config();
 
-  // Wait for MgrDigest...?
-  // TODO
+  // Wait for MgrDigest...
+  dout(4) << "waiting for MgrDigest..." << dendl;
+  while (!digest_received) {
+    digest_cond.Wait(lock);
+  }
 
   // assume finisher already initialized in background_init
-
-  py_modules.init();
-  py_modules.start();
+  dout(4) << "starting python modules..." << dendl;
+  py_module_registry->active_start(loaded_config, daemon_state, cluster_state, *monc,
+      clog, *objecter, *client, finisher);
 
   dout(4) << "Complete." << dendl;
   initializing = false;
@@ -259,7 +255,7 @@ void Mgr::load_all_metadata()
     }
 
     DaemonStatePtr dm = std::make_shared<DaemonState>(daemon_state.types);
-    dm->key = DaemonKey(CEPH_ENTITY_TYPE_MDS,
+    dm->key = DaemonKey("mds",
                         daemon_meta.at("name").get_str());
     dm->hostname = daemon_meta.at("hostname").get_str();
 
@@ -281,7 +277,7 @@ void Mgr::load_all_metadata()
     }
 
     DaemonStatePtr dm = std::make_shared<DaemonState>(daemon_state.types);
-    dm->key = DaemonKey(CEPH_ENTITY_TYPE_MON,
+    dm->key = DaemonKey("mon",
                         daemon_meta.at("name").get_str());
     dm->hostname = daemon_meta.at("hostname").get_str();
 
@@ -304,7 +300,7 @@ void Mgr::load_all_metadata()
     dout(4) << osd_metadata.at("hostname").get_str() << dendl;
 
     DaemonStatePtr dm = std::make_shared<DaemonState>(daemon_state.types);
-    dm->key = DaemonKey(CEPH_ENTITY_TYPE_OSD,
+    dm->key = DaemonKey("osd",
                         stringify(osd_metadata.at("id").get_int()));
     dm->hostname = osd_metadata.at("hostname").get_str();
 
@@ -319,13 +315,13 @@ void Mgr::load_all_metadata()
   }
 }
 
-void Mgr::load_config()
+std::map<std::string, std::string> Mgr::load_config()
 {
   assert(lock.is_locked_by_me());
 
   dout(10) << "listing keys" << dendl;
   JSONCommand cmd;
-  cmd.run(monc, "{\"prefix\": \"config-key list\"}");
+  cmd.run(monc, "{\"prefix\": \"config-key ls\"}");
   lock.Unlock();
   cmd.wait();
   lock.Lock();
@@ -337,7 +333,7 @@ void Mgr::load_config()
     std::string const key = key_str.get_str();
     dout(20) << "saw key '" << key << "'" << dendl;
 
-    const std::string config_prefix = PyModules::config_prefix;
+    const std::string config_prefix = PyModuleRegistry::config_prefix;
 
     if (key.substr(0, config_prefix.size()) == config_prefix) {
       dout(20) << "fetching '" << key << "'" << dendl;
@@ -345,14 +341,15 @@ void Mgr::load_config()
       std::ostringstream cmd_json;
       cmd_json << "{\"prefix\": \"config-key get\", \"key\": \"" << key << "\"}";
       get_cmd.run(monc, cmd_json.str());
+      lock.Unlock();
       get_cmd.wait();
+      lock.Lock();
       assert(get_cmd.r == 0);
-
       loaded[key] = get_cmd.outbl.to_str();
     }
   }
 
-  py_modules.insert_config(loaded);
+  return loaded;
 }
 
 void Mgr::shutdown()
@@ -368,7 +365,7 @@ void Mgr::shutdown()
       server.shutdown();
     }
     // after the messenger is stopped, signal modules to shutdown via finisher
-    py_modules.shutdown();
+    py_module_registry->active_shutdown();
   }));
 
   // Then stop the finisher to ensure its enqueued contexts aren't going
@@ -389,7 +386,7 @@ void Mgr::handle_osd_map()
    * reload the metadata.
    */
   objecter->with_osdmap([this, &names_exist](const OSDMap &osd_map) {
-    for (unsigned int osd_id = 0; osd_id < osd_map.get_num_osds(); ++osd_id) {
+    for (unsigned int osd_id = 0; osd_id < osd_map.get_max_osd(); ++osd_id) {
       if (!osd_map.exists(osd_id)) {
         continue;
       }
@@ -399,13 +396,14 @@ void Mgr::handle_osd_map()
 
       // Consider whether to update the daemon metadata (new/restarted daemon)
       bool update_meta = false;
-      const auto k = DaemonKey(CEPH_ENTITY_TYPE_OSD, stringify(osd_id));
+      const auto k = DaemonKey("osd", stringify(osd_id));
       if (daemon_state.is_updating(k)) {
         continue;
       }
 
       if (daemon_state.exists(k)) {
         auto metadata = daemon_state.get(k);
+	Mutex::Locker l(metadata->lock);
         auto addr_iter = metadata->metadata.find("front_addr");
         if (addr_iter != metadata->metadata.end()) {
           const std::string &metadata_addr = addr_iter->second;
@@ -444,16 +442,23 @@ void Mgr::handle_osd_map()
   });
 
   // TODO: same culling for MonMap
-  daemon_state.cull(CEPH_ENTITY_TYPE_OSD, names_exist);
+  daemon_state.cull("osd", names_exist);
 }
 
 void Mgr::handle_log(MLog *m)
 {
   for (const auto &e : m->entries) {
-    py_modules.notify_all(e);
+    py_module_registry->notify_all(e);
   }
 
   m->put();
+}
+
+void Mgr::handle_service_map(MServiceMap *m)
+{
+  dout(10) << "e" << m->service_map.epoch << dendl;
+  cluster_state.set_service_map(m->service_map);
+  server.got_service_map();
 }
 
 bool Mgr::ms_dispatch(Message *m)
@@ -466,32 +471,27 @@ bool Mgr::ms_dispatch(Message *m)
       handle_mgr_digest(static_cast<MMgrDigest*>(m));
       break;
     case CEPH_MSG_MON_MAP:
-      // FIXME: we probably never get called here because MonClient
-      // has consumed the message.  For consuming OSDMap we need
-      // to be the tail dispatcher, but to see MonMap we would
-      // need to be at the head.
-      // Result is that ClusterState has access to monmap (it reads
-      // from monclient anyway), but we don't see notifications.  Hook
-      // into MonClient to get notifications instead of messing
-      // with message delivery to achieve it?
-      ceph_abort();
-
-      py_modules.notify_all("mon_map", "");
+      py_module_registry->notify_all("mon_map", "");
       m->put();
       break;
     case CEPH_MSG_FS_MAP:
-      py_modules.notify_all("fs_map", "");
+      py_module_registry->notify_all("fs_map", "");
       handle_fs_map((MFSMap*)m);
       return false; // I shall let this pass through for Client
       break;
     case CEPH_MSG_OSD_MAP:
       handle_osd_map();
 
-      py_modules.notify_all("osd_map", "");
+      py_module_registry->notify_all("osd_map", "");
 
       // Continuous subscribe, so that we can generate notifications
       // for our MgrPyModules
       objecter->maybe_request_map();
+      m->put();
+      break;
+    case MSG_SERVICE_MAP:
+      handle_service_map((MServiceMap*)m);
+      py_module_registry->notify_all("service_map", "");
       m->put();
       break;
     case MSG_LOG:
@@ -533,7 +533,7 @@ void Mgr::handle_fs_map(MFSMap* m)
     // Remember which MDS exists so that we can cull any that don't
     names_exist.insert(info.name);
 
-    const auto k = DaemonKey(CEPH_ENTITY_TYPE_MDS, info.name);
+    const auto k = DaemonKey("mds", info.name);
     if (daemon_state.is_updating(k)) {
       continue;
     }
@@ -541,6 +541,7 @@ void Mgr::handle_fs_map(MFSMap* m)
     bool update = false;
     if (daemon_state.exists(k)) {
       auto metadata = daemon_state.get(k);
+      Mutex::Locker l(metadata->lock);
       if (metadata->metadata.empty() ||
 	  metadata->metadata.count("addr") == 0) {
         update = true;
@@ -573,23 +574,70 @@ void Mgr::handle_fs_map(MFSMap* m)
           {}, &c->outbl, &c->outs, c);
     }
   }
-  daemon_state.cull(CEPH_ENTITY_TYPE_MDS, names_exist);
+  daemon_state.cull("mds", names_exist);
 }
 
+bool Mgr::got_mgr_map(const MgrMap& m)
+{
+  Mutex::Locker l(lock);
+  dout(10) << m << dendl;
+
+  set<string> old_modules;
+  cluster_state.with_mgrmap([&](const MgrMap& m) {
+      old_modules = m.modules;
+    });
+  if (m.modules != old_modules) {
+    derr << "mgrmap module list changed to (" << m.modules << "), respawn"
+	 << dendl;
+    return true;
+  }
+
+  cluster_state.set_mgr_map(m);
+
+  return false;
+}
 
 void Mgr::handle_mgr_digest(MMgrDigest* m)
 {
   dout(10) << m->mon_status_json.length() << dendl;
   dout(10) << m->health_json.length() << dendl;
   cluster_state.load_digest(m);
-  py_modules.notify_all("mon_status", "");
-  py_modules.notify_all("health", "");
+  py_module_registry->notify_all("mon_status", "");
+  py_module_registry->notify_all("health", "");
 
   // Hack: use this as a tick/opportunity to prompt python-land that
   // the pgmap might have changed since last time we were here.
-  py_modules.notify_all("pg_summary", "");
+  py_module_registry->notify_all("pg_summary", "");
   dout(10) << "done." << dendl;
 
   m->put();
+
+  if (!digest_received) {
+    digest_received = true;
+    digest_cond.Signal();
+  }
+}
+
+void Mgr::tick()
+{
+  dout(10) << dendl;
+  server.send_report();
+}
+
+std::vector<MonCommand> Mgr::get_command_set() const
+{
+  Mutex::Locker l(lock);
+
+  std::vector<MonCommand> commands = mgr_commands;
+  std::vector<MonCommand> py_commands = py_module_registry->get_commands();
+  commands.insert(commands.end(), py_commands.begin(), py_commands.end());
+  return commands;
+}
+
+std::map<std::string, std::string> Mgr::get_services() const
+{
+  Mutex::Locker l(lock);
+
+  return py_module_registry->get_services();
 }
 

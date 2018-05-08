@@ -161,6 +161,18 @@ public:
   int get_params() override;
 };
 
+class RGWGetObjTags_ObjStore : public RGWGetObjTags {
+public:
+  RGWGetObjTags_ObjStore() {};
+  ~RGWGetObjTags_ObjStore() {};
+};
+
+class RGWPutObjTags_ObjStore: public RGWPutObjTags {
+public:
+  RGWPutObjTags_ObjStore() {};
+  ~RGWPutObjTags_ObjStore() {};
+};
+
 class RGWListBuckets_ObjStore : public RGWListBuckets {
 public:
   RGWListBuckets_ObjStore() {}
@@ -212,8 +224,6 @@ public:
   int verify_params() override;
   int get_params() override;
   int get_data(bufferlist& bl) override;
-
-  int get_padding_last_aws4_chunk_encoded(bufferlist &bl, uint64_t chunk_size);
 };
 
 class RGWPostObj_ObjStore : public RGWPostObj
@@ -491,7 +501,6 @@ public:
   RGWHandler_REST() {}
   ~RGWHandler_REST() override {}
 
-  static int validate_tenant_name(const string& bucket);
   static int validate_bucket_name(const string& bucket);
   static int validate_object_name(const string& object);
 
@@ -626,8 +635,6 @@ public:
 static constexpr int64_t NO_CONTENT_LENGTH = -1;
 static constexpr int64_t CHUNKED_TRANSFER_ENCODING = -2;
 
-extern void set_req_state_err(struct rgw_err &err, int err_no, int prot_flags);
-extern void set_req_state_err(struct req_state *s, int err_no);
 extern void dump_errno(int http_ret, string& out);
 extern void dump_errno(const struct rgw_err &err, string& out);
 extern void dump_errno(struct req_state *s);
@@ -655,6 +662,7 @@ extern void dump_header(struct req_state* s,
 extern void dump_header(struct req_state* s,
                         const boost::string_ref& name,
                         const utime_t& val);
+
 template <class... Args>
 static inline void dump_header_prefixed(struct req_state* s,
                                         const boost::string_ref& name_prefix,
@@ -666,6 +674,24 @@ static inline void dump_header_prefixed(struct req_state* s,
                             name_prefix.data(),
                             static_cast<int>(name.length()),
                             name.data());
+  boost::string_ref full_name(full_name_buf, len);
+  return dump_header(s, std::move(full_name), std::forward<Args>(args)...);
+}
+
+template <class... Args>
+static inline void dump_header_infixed(struct req_state* s,
+                                       const boost::string_ref& prefix,
+                                       const boost::string_ref& infix,
+                                       const boost::string_ref& sufix,
+                                       Args&&... args) {
+  char full_name_buf[prefix.size() + infix.size() + sufix.size() + 1];
+  const auto len = snprintf(full_name_buf, sizeof(full_name_buf), "%.*s%.*s%.*s",
+                            static_cast<int>(prefix.length()),
+                            prefix.data(),
+                            static_cast<int>(infix.length()),
+                            infix.data(),
+                            static_cast<int>(sufix.length()),
+                            sufix.data());
   boost::string_ref full_name(full_name_buf, len);
   return dump_header(s, std::move(full_name), std::forward<Args>(args)...);
 }
@@ -690,7 +716,24 @@ static inline void dump_header_if_nonempty(struct req_state* s,
   }
 }
 
+static inline std::string compute_domain_uri(const struct req_state *s) {
+  std::string uri = (!s->info.domain.empty()) ? s->info.domain :
+    [&s]() -> std::string {
+    auto env = *(s->info.env);
+    std::string uri =
+    env.get("SERVER_PORT_SECURE") ? "https://" : "http://";
+    if (env.exists("SERVER_NAME")) {
+      uri.append(env.get("SERVER_NAME", "<SERVER_NAME>"));
+    } else {
+      uri.append(env.get("HTTP_HOST", "<HTTP_HOST>"));
+    }
+    return uri;
+  }();
+  return uri;
+}
+
 extern void dump_content_length(struct req_state *s, uint64_t len);
+extern int64_t parse_content_length(const char *content_length);
 extern void dump_etag(struct req_state *s,
                       const boost::string_ref& etag,
                       bool quoted = false);
@@ -721,7 +764,6 @@ extern void dump_access_control(req_state *s, RGWOp *op);
 extern int dump_body(struct req_state* s, const char* buf, size_t len);
 extern int dump_body(struct req_state* s, /* const */ ceph::buffer::list& bl);
 extern int dump_body(struct req_state* s, const std::string& str);
-
 extern int recv_body(struct req_state* s, char* buf, size_t max);
 
 #endif /* CEPH_RGW_REST_H */

@@ -12,7 +12,6 @@
  * 
  */
 
-#include <errno.h>
 #include <sys/utsname.h>
 #include <boost/lexical_cast.hpp>
 
@@ -20,7 +19,6 @@
 #include "include/util.h"
 #include "common/debug.h"
 #include "common/errno.h"
-#include "common/strtol.h"
 #include "common/version.h"
 
 #ifdef HAVE_SYS_VFS_H
@@ -31,6 +29,10 @@
 #include <sys/param.h>
 #include <sys/mount.h>
 #endif
+
+#include <string>
+
+#include <stdio.h>
 
 int64_t unit_to_bytesize(string val, ostream *pss)
 {
@@ -303,4 +305,16 @@ string cleanbin(string &str)
   if (base64)
     result = "Base64:" + result;
   return result;
+}
+
+std::string bytes2str(uint64_t count) {
+  static char s[][2] = {"\0", "k", "M", "G", "T", "P", "E", "\0"};
+  int i = 0;
+  while (count >= 1024 && *s[i+1]) {
+    count >>= 10;
+    i++;
+  }
+  char str[128];
+  snprintf(str, sizeof str, "%" PRIu64 "%sB", count, s[i]);
+  return std::string(str);
 }

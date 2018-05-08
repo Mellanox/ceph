@@ -462,7 +462,7 @@ class LocalFuseMount(FuseMount):
 
         prefix = [os.path.join(BIN_PREFIX, "ceph-fuse")]
         if os.getuid() != 0:
-            prefix += ["--client-die-on-failed-remount=false"]
+            prefix += ["--client_die_on_failed_dentry_invalidate=false"]
 
         if mount_path is not None:
             prefix += ["--client_mountpoint={0}".format(mount_path)]
@@ -678,8 +678,8 @@ class LocalMDSCluster(LocalCephCluster, MDSCluster):
         # FIXME: unimplemented
         pass
 
-    def newfs(self, name):
-        return LocalFilesystem(self._ctx, create=name)
+    def newfs(self, name='cephfs', create=True):
+        return LocalFilesystem(self._ctx, name=name, create=create)
 
 
 class LocalMgrCluster(LocalCephCluster, MgrCluster):
@@ -691,13 +691,16 @@ class LocalMgrCluster(LocalCephCluster, MgrCluster):
 
 
 class LocalFilesystem(Filesystem, LocalMDSCluster):
-    def __init__(self, ctx, fscid=None, create=None):
+    def __init__(self, ctx, fscid=None, name='cephfs', create=False):
         # Deliberately skip calling parent constructor
         self._ctx = ctx
 
         self.id = None
         self.name = None
+        self.ec_profile = None
         self.metadata_pool_name = None
+        self.metadata_overlay = False
+        self.data_pool_name = None
         self.data_pools = None
 
         # Hack: cheeky inspection of ceph.conf to see what MDSs exist
@@ -722,17 +725,15 @@ class LocalFilesystem(Filesystem, LocalMDSCluster):
 
         self._conf = defaultdict(dict)
 
-        if create is not None:
+        if name is not None:
             if fscid is not None:
                 raise RuntimeError("cannot specify fscid when creating fs")
-            if create is True:
-                self.name = 'cephfs'
-            else:
-                self.name = create
-            self.create()
-        elif fscid is not None:
-            self.id = fscid
-        self.getinfo(refresh=True)
+            if create and not self.legacy_configured():
+                self.create()
+        else:
+            if fscid is not None:
+                self.id = fscid
+                self.getinfo(refresh=True)
 
         # Stash a reference to the first created filesystem on ctx, so
         # that if someone drops to the interactive shell they can easily
@@ -910,7 +911,7 @@ def exec_test():
 
         # Wait for OSD to come up so that subsequent injectargs etc will
         # definitely succeed
-        LocalCephCluster(LocalContext()).mon_manager.wait_for_all_up(timeout=30)
+        LocalCephCluster(LocalContext()).mon_manager.wait_for_all_osds_up(timeout=30)
 
     # List of client mounts, sufficient to run the selected tests
     clients = [i.__str__() for i in range(0, max_required_clients)]

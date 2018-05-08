@@ -13,9 +13,7 @@
 
 void RGWLoadGenRequestEnv::set_date(utime_t& tm)
 {
-  stringstream s;
-  tm.asctime(s);
-  date_str = s.str();
+  date_str = rgw_to_asctime(tm);
 }
 
 int RGWLoadGenRequestEnv::sign(RGWAccessKey& access_key)
@@ -35,13 +33,17 @@ int RGWLoadGenRequestEnv::sign(RGWAccessKey& access_key)
                                  sub_resources,
                                  canonical_header);
 
-  int ret = rgw_get_s3_header_digest(canonical_header, access_key.key, digest);
-  if (ret < 0) {
+  headers["HTTP_DATE"] = date_str;
+  try {
+    /* FIXME(rzarzynski): kill the dependency on g_ceph_context. */
+    const auto signature = static_cast<std::string>(
+      rgw::auth::s3::get_v2_signature(g_ceph_context, canonical_header,
+                                      access_key.key));
+    headers["HTTP_AUTHORIZATION"] = \
+      std::string("AWS ") + access_key.id + ":" + signature;
+  } catch (int ret) {
     return ret;
   }
-
-  headers["HTTP_DATE"] = date_str;
-  headers["HTTP_AUTHORIZATION"] = string("AWS ") + access_key.id + ":" + digest;
 
   return 0;
 }
@@ -69,7 +71,7 @@ size_t RGWLoadGenIO::complete_request()
   return 0;
 }
 
-void RGWLoadGenIO::init_env(CephContext *cct)
+int RGWLoadGenIO::init_env(CephContext *cct)
 {
   env.init(cct);
 
@@ -94,6 +96,7 @@ void RGWLoadGenIO::init_env(CephContext *cct)
   char port_buf[16];
   snprintf(port_buf, sizeof(port_buf), "%d", req->port);
   env.set("SERVER_PORT", port_buf);
+  return 0;
 }
 
 size_t RGWLoadGenIO::send_status(const int status,

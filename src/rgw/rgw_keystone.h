@@ -12,6 +12,7 @@
 #include "rgw_common.h"
 #include "rgw_http_client.h"
 #include "common/Cond.h"
+#include "global/global_init.h"
 
 #include <atomic>
 
@@ -224,7 +225,7 @@ class TokenCache {
     friend class TokenCache;
     typedef RGWPostHTTPData RGWGetRevokedTokens;
 
-    CephContext * const cct;
+    CephContext* const cct;
     TokenCache* const cache;
     const rgw::keystone::Config& config;
 
@@ -239,12 +240,13 @@ class TokenCache {
         config(config),
         lock("rgw::keystone::TokenCache::RevokeThread") {
     }
+
     void *entry() override;
     void stop();
     int check_revoked();
   } revocator;
 
-  CephContext * const cct;
+  const boost::intrusive_ptr<CephContext> cct;
 
   std::string admin_token_id;
   std::string barbican_token_id;
@@ -275,8 +277,11 @@ class TokenCache {
   ~TokenCache() {
     down_flag = true;
 
-    revocator.stop();
-    revocator.join();
+    // Only stop and join if revocator thread is started.
+    if (revocator.is_started()) {
+      revocator.stop();
+      revocator.join();
+    }
   }
 
 public:

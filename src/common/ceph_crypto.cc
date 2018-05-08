@@ -12,15 +12,8 @@
  *
  */
 
-#include "include/int_types.h"
 #include "common/config.h"
-#include "common/ceph_context.h"
 #include "ceph_crypto.h"
-#include "auth/Crypto.h"
-
-#include <pthread.h>
-#include <stdlib.h>
-
 
 #ifdef USE_CRYPTOPP
 void ceph::crypto::init(CephContext *cct)
@@ -67,7 +60,7 @@ void ceph::crypto::init(CephContext *cct)
     memset(&init_params, 0, sizeof(init_params));
     init_params.length = sizeof(init_params);
 
-    uint32_t flags = NSS_INIT_READONLY;
+    uint32_t flags = (NSS_INIT_READONLY | NSS_INIT_PK11RELOAD);
     if (cct->_conf->nss_db_path.empty()) {
       flags |= (NSS_INIT_NOCERTDB | NSS_INIT_NOMODDB);
     }

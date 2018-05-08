@@ -32,6 +32,7 @@ void RGWOp_User_Info::execute()
 
   std::string uid_str;
   bool fetch_stats;
+  bool sync_stats;
 
   RESTArgs::get_string(s, "uid", uid_str, &uid_str);
 
@@ -47,8 +48,11 @@ void RGWOp_User_Info::execute()
 
   RESTArgs::get_bool(s, "stats", false, &fetch_stats);
 
+  RESTArgs::get_bool(s, "sync", false, &sync_stats);
+
   op_state.set_user_id(uid);
   op_state.set_fetch_stats(fetch_stats);
+  op_state.set_sync_stats(sync_stats);
 
   http_ret = RGWUserAdminOp_User::info(store, op_state, flusher);
 }
@@ -76,6 +80,7 @@ void RGWOp_User_Create::execute()
   std::string secret_key;
   std::string key_type_str;
   std::string caps;
+  std::string tenant_name;
 
   bool gen_key;
   bool suspended;
@@ -96,6 +101,7 @@ void RGWOp_User_Create::execute()
   RESTArgs::get_string(s, "secret-key", secret_key, &secret_key);
   RESTArgs::get_string(s, "key-type", key_type_str, &key_type_str);
   RESTArgs::get_string(s, "user-caps", caps, &caps);
+  RESTArgs::get_string(s, "tenant", tenant_name, &tenant_name);
   RESTArgs::get_bool(s, "generate-key", true, &gen_key);
   RESTArgs::get_bool(s, "suspended", false, &suspended);
   RESTArgs::get_int32(s, "max-buckets", default_max_buckets, &max_buckets);
@@ -106,6 +112,10 @@ void RGWOp_User_Create::execute()
     ldout(s->cct, 0) << "cannot set system flag by non-system user" << dendl;
     http_ret = -EINVAL;
     return;
+  }
+
+  if (!tenant_name.empty()) {
+    uid.tenant = tenant_name;
   }
 
   // TODO: validate required args are passed in. (for eg. uid and display_name here)
@@ -408,8 +418,12 @@ void RGWOp_Subuser_Modify::execute()
 
   op_state.set_user_id(uid);
   op_state.set_subuser(subuser);
-  op_state.set_secret_key(secret_key);
-  op_state.set_gen_secret();
+
+  if (!secret_key.empty())
+    op_state.set_secret_key(secret_key);
+
+  if (gen_secret)
+    op_state.set_gen_secret();
 
   if (!key_type_str.empty()) {
     if (key_type_str.compare("swift") == 0)
@@ -693,6 +707,11 @@ void RGWOp_Quota_Info::execute()
   if (http_ret < 0)
     return;
 
+  if (!op_state.has_existing_user()) {
+    http_ret = -ERR_NO_SUCH_USER;
+    return;
+  }
+
   RGWUserInfo info;
   string err_msg;
   http_ret = user.info(info, &err_msg);
@@ -822,6 +841,11 @@ void RGWOp_Quota_Set::execute()
   http_ret = user.init(store, op_state);
   if (http_ret < 0) {
     ldout(store->ctx(), 20) << "failed initializing user info: " << http_ret << dendl;
+    return;
+  }
+
+  if (!op_state.has_existing_user()) {
+    http_ret = -ERR_NO_SUCH_USER;
     return;
   }
 

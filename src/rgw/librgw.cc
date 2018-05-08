@@ -11,6 +11,7 @@
  * Foundation.  See file COPYING.
  *
  */
+#include "include/compat.h"
 #include <sys/types.h>
 #include <string.h>
 #include <chrono>
@@ -21,7 +22,9 @@
 #include "rgw_acl.h"
 
 #include "include/str_list.h"
+#include "include/stringify.h"
 #include "global/global_init.h"
+#include "global/signal_handler.h"
 #include "common/config.h"
 #include "common/errno.h"
 #include "common/Timer.h"
@@ -58,6 +61,11 @@
 #define dout_subsys ceph_subsys_rgw
 
 bool global_stop = false;
+
+static void handle_sigterm(int signum)
+{
+  dout(20) << __func__ << " SIGUSR1 ignored" << dendl;
+}
 
 namespace rgw {
 
@@ -101,7 +109,7 @@ namespace rgw {
       auto expire_s = cct->_conf->rgw_nfs_namespace_expire_secs;
 
       /* delay between gc cycles */
-      auto delay_s = std::max(1, std::min(MIN_EXPIRE_S, expire_s/2));
+      auto delay_s = std::max(int64_t(1), std::min(int64_t(MIN_EXPIRE_S), expire_s/2));
 
       unique_lock uniq(mtx);
     restart:
@@ -481,7 +489,8 @@ namespace rgw {
 					 g_conf->rgw_enable_gc_threads,
 					 g_conf->rgw_enable_lc_threads,
 					 g_conf->rgw_enable_quota_threads,
-					 g_conf->rgw_run_sync_thread);
+					 g_conf->rgw_run_sync_thread,
+					 g_conf->rgw_dynamic_resharding);
 
     if (!store) {
       mutex.Lock();
@@ -532,8 +541,17 @@ namespace rgw {
     int port = 80;
     RGWProcessEnv env = { store, &rest, olog, port };
 
+    string fe_count{"0"};
     fec = new RGWFrontendConfig("rgwlib");
     fe = new RGWLibFrontend(env, fec);
+
+    init_async_signal_handler();
+    register_async_signal_handler(SIGUSR1, handle_sigterm);
+
+    map<string, string> service_map_meta;
+    service_map_meta["pid"] = stringify(getpid());
+    service_map_meta["frontend_type#" + fe_count] = "rgw-nfs";
+    service_map_meta["frontend_config#" + fe_count] = fec->get_config();
 
     fe->init();
     if (r < 0) {
@@ -542,6 +560,12 @@ namespace rgw {
     }
 
     fe->run();
+
+    r = store->register_to_service_map("rgw-nfs", service_map_meta);
+    if (r < 0) {
+      derr << "ERROR: failed to register to service map: " << cpp_strerror(-r) << dendl;
+      /* ignore error */
+    }
 
     return 0;
   } /* RGWLib::init() */
@@ -557,6 +581,9 @@ namespace rgw {
     delete fe;
     delete fec;
     delete ldh;
+
+    unregister_async_signal_handler(SIGUSR1, handle_sigterm);
+    shutdown_async_signal_handler();
 
     rgw_log_usage_finalize();
 

@@ -91,9 +91,14 @@ bool ObjectMap<I>::object_may_exist(uint64_t object_no) const
 
   // Fall back to default logic if object map is disabled or invalid
   if (!m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP,
-                                 m_image_ctx.snap_lock) ||
-      m_image_ctx.test_flags(RBD_FLAG_OBJECT_MAP_INVALID,
-                             m_image_ctx.snap_lock)) {
+                                 m_image_ctx.snap_lock)) {
+    return true;
+  }
+
+  bool flags_set;
+  int r = m_image_ctx.test_flags(RBD_FLAG_OBJECT_MAP_INVALID,
+                                 m_image_ctx.snap_lock, &flags_set);
+  if (r < 0 || flags_set) {
     return true;
   }
 
@@ -106,10 +111,10 @@ bool ObjectMap<I>::object_may_exist(uint64_t object_no) const
 }
 
 template <typename I>
-bool ObjectMap<I>::update_required(uint64_t object_no, uint8_t new_state) {
+bool ObjectMap<I>::update_required(const ceph::BitVector<2>::Iterator& it,
+                                   uint8_t new_state) {
   assert(m_image_ctx.object_map_lock.is_wlocked());
-  uint8_t state = (*this)[object_no];
-
+  uint8_t state = *it;
   if ((state == new_state) ||
       (new_state == OBJECT_PENDING && state == OBJECT_NONEXISTENT) ||
       (new_state == OBJECT_NONEXISTENT && state != OBJECT_PENDING)) {
@@ -134,6 +139,17 @@ void ObjectMap<I>::close(Context *on_finish) {
 
   auto req = object_map::UnlockRequest<I>::create(m_image_ctx, on_finish);
   req->send();
+}
+
+template <typename I>
+bool ObjectMap<I>::set_object_map(ceph::BitVector<2> &target_object_map) {
+  assert(m_image_ctx.owner_lock.is_locked());
+  assert(m_image_ctx.snap_lock.is_locked());
+  assert(m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP,
+                                   m_image_ctx.snap_lock));
+  RWLock::RLocker object_map_locker(m_image_ctx.object_map_lock);
+  m_object_map = target_object_map;
+  return true;
 }
 
 template <typename I>
@@ -219,7 +235,7 @@ void ObjectMap<I>::detained_aio_update(UpdateOperation &&op) {
 
   BlockGuardCell *cell;
   int r = m_update_guard->detain({op.start_object_no, op.end_object_no},
-                                &op, &cell);
+                                 &op, &cell);
   if (r < 0) {
     lderr(cct) << "failed to detain object map update: " << cpp_strerror(r)
                << dendl;
@@ -242,7 +258,7 @@ void ObjectMap<I>::detained_aio_update(UpdateOperation &&op) {
       handle_detained_aio_update(cell, r, on_finish);
     });
   aio_update(CEPH_NOSNAP, op.start_object_no, op.end_object_no, op.new_state,
-             op.current_state, ctx);
+             op.current_state, op.parent_trace, ctx);
 }
 
 template <typename I>
@@ -269,6 +285,7 @@ template <typename I>
 void ObjectMap<I>::aio_update(uint64_t snap_id, uint64_t start_object_no,
                               uint64_t end_object_no, uint8_t new_state,
                               const boost::optional<uint8_t> &current_state,
+                              const ZTracer::Trace &parent_trace,
                               Context *on_finish) {
   assert(m_image_ctx.snap_lock.is_locked());
   assert((m_image_ctx.features & RBD_FEATURE_OBJECT_MAP) != 0);
@@ -291,13 +308,14 @@ void ObjectMap<I>::aio_update(uint64_t snap_id, uint64_t start_object_no,
       return;
     }
 
-    uint64_t object_no;
-    for (object_no = start_object_no; object_no < end_object_no; ++object_no) {
-      if (update_required(object_no, new_state)) {
+    auto it = m_object_map.begin() + start_object_no;
+    auto end_it = m_object_map.begin() + end_object_no;
+    for (; it != end_it; ++it) {
+      if (update_required(it, new_state)) {
         break;
       }
     }
-    if (object_no == end_object_no) {
+    if (it == end_it) {
       ldout(cct, 20) << "object map update not required" << dendl;
       m_image_ctx.op_work_queue->queue(on_finish, 0);
       return;
@@ -306,7 +324,7 @@ void ObjectMap<I>::aio_update(uint64_t snap_id, uint64_t start_object_no,
 
   auto req = object_map::UpdateRequest<I>::create(
     m_image_ctx, &m_object_map, snap_id, start_object_no, end_object_no,
-    new_state, current_state, on_finish);
+    new_state, current_state, parent_trace, on_finish);
   req->send();
 }
 

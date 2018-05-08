@@ -88,7 +88,7 @@ private:
   MonOpRequest(Message *req, OpTracker *tracker) :
     TrackedOp(tracker,
       req->get_recv_stamp().is_zero() ?
-      req->get_recv_stamp() : ceph_clock_now()),
+      ceph_clock_now() : req->get_recv_stamp()),
     request(req),
     session(NULL),
     con(NULL),
@@ -217,5 +217,31 @@ public:
 };
 
 typedef MonOpRequest::Ref MonOpRequestRef;
+
+struct C_MonOp : public Context
+{
+  MonOpRequestRef op;
+
+  explicit C_MonOp(MonOpRequestRef o) :
+    op(o) { }
+
+  void finish(int r) override {
+    if (op && r == -ECANCELED) {
+      op->mark_event("callback canceled");
+    } else if (op && r == -EAGAIN) {
+      op->mark_event("callback retry");
+    } else if (op && r == 0) {
+      op->mark_event("callback finished");
+    }
+    _finish(r);
+  }
+
+  void mark_op_event(const string &event) {
+    if (op)
+      op->mark_event_string(event);
+  }
+
+  virtual void _finish(int r) = 0;
+};
 
 #endif /* MON_OPREQUEST_H_ */

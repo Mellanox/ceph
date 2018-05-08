@@ -12,36 +12,19 @@
  * 
  */
 
-#include "include/int_types.h"
-
-#include "common/Thread.h"
 #include "common/admin_socket.h"
 #include "common/admin_socket_client.h"
-#include "common/config.h"
-#include "common/cmdparse.h"
-#include "common/dout.h"
 #include "common/errno.h"
-#include "common/perf_counters.h"
 #include "common/pipe.h"
 #include "common/safe_io.h"
 #include "common/version.h"
-#include "common/Formatter.h"
-
-#include <errno.h>
-#include <fcntl.h>
-#include <map>
-#include <poll.h>
-#include <set>
-#include <sstream>
-#include <stdint.h>
-#include <string.h>
-#include <string>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/un.h>
-#include <unistd.h>
-
 #include "include/compat.h"
+
+#include <poll.h>
+#include <sys/un.h>
+
+// re-include our assert to clobber the system one; fix dout:
+#include "include/assert.h"
 
 #define dout_subsys ceph_subsys_asok
 #undef dout_prefix
@@ -382,7 +365,7 @@ bool AdminSocket::do_accept()
   stringstream errss;
   cmdvec.push_back(cmd);
   if (!cmdmap_from_json(cmdvec, &cmdmap, errss)) {
-    ldout(m_cct, 0) << "AdminSocket: " << errss.rdbuf() << dendl;
+    ldout(m_cct, 0) << "AdminSocket: " << errss.str() << dendl;
     VOID_TEMP_FAILURE_RETRY(close(connection_fd));
     return false;
   }
@@ -509,10 +492,13 @@ public:
     } else {
       JSONFormatter jf;
       jf.open_object_section("version");
-      if (command == "version")
+      if (command == "version") {
 	jf.dump_string("version", ceph_version_to_str());
-      else if (command == "git_version")
+	jf.dump_string("release", ceph_release_name(ceph_release()));
+	jf.dump_string("release_type", ceph_release_type());
+      } else if (command == "git_version") {
 	jf.dump_string("git_version", git_version_to_str());
+      }
       ostringstream ss;
       jf.close_section();
       jf.flush(ss);
@@ -550,7 +536,7 @@ public:
   explicit GetdescsHook(AdminSocket *as) : m_as(as) {}
   bool call(string command, cmdmap_t &cmdmap, string format, bufferlist& out) override {
     int cmdnum = 0;
-    JSONFormatter jf(false);
+    JSONFormatter jf;
     jf.open_object_section("command_descriptions");
     for (map<string,string>::iterator p = m_as->m_descs.begin();
 	 p != m_as->m_descs.end();
@@ -564,6 +550,7 @@ public:
       cmdnum++;
     }
     jf.close_section(); // command_descriptions
+    jf.enable_line_break();
     ostringstream ss;
     jf.flush(ss);
     out.append(ss.str());

@@ -816,11 +816,7 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
         task->device->aio_callback(task->device->aio_callback_priv, ctx->priv);
       }
     } else {
-      if (ctx->num_running == 1) {
-	ctx->aio_wake();
-      } else {
-	--ctx->num_running;
-      }
+      ctx->try_aio_wake();
     }
     task->release_segs(queue);
     delete task;
@@ -837,11 +833,7 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
           task->device->aio_callback(task->device->aio_callback_priv, ctx->priv);
 	}
       } else {
-	if (ctx->num_running == 1) {
-	  ctx->aio_wake();
-	} else {
-	  --ctx->num_running;
-	}
+	ctx->try_aio_wake();
       }
       delete task;
     } else {
@@ -1036,7 +1028,7 @@ int NVMEDevice::aio_write(
 int NVMEDevice::write(uint64_t off, bufferlist &bl, bool buffered)
 {
   // FIXME: there is presumably a more efficient way to do this...
-  IOContext ioc(NULL);
+  IOContext ioc(cct, NULL);
   aio_write(off, bl, &ioc, buffered);
   ioc.aio_wait();
   return 0;

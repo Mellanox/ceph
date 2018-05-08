@@ -23,7 +23,7 @@ class MOSDPGInfo : public Message {
   static const int HEAD_VERSION = 5;
   static const int COMPAT_VERSION = 1;
 
-  epoch_t epoch;
+  epoch_t epoch = 0;
 
 public:
   vector<pair<pg_notify_t,PastIntervals> > pg_list;
@@ -58,7 +58,9 @@ public:
   }
 
   void encode_payload(uint64_t features) override {
-    if (!HAVE_FEATURE(features, SERVER_LUMINOUS)) {
+    if (HAVE_FEATURE(features, SERVER_LUMINOUS)) {
+      header.version = HEAD_VERSION;
+    } else {
       header.version = 4;
 
       // for kraken+jewel only

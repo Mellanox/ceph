@@ -136,11 +136,11 @@ int main(int argc, char* argv[]) {
     // lambda to post a request to the identified server; called by client
     test::SubmitFunc server_post_f =
         [&simulation](const ServerId& server,
-                      const sim::TestRequest& request,
+                      sim::TestRequest&& request,
                       const ClientId& client_id,
                       const test::dmc::ReqParams& req_params) {
         test::DmcServer& s = simulation->get_server(server);
-        s.post(request, client_id, req_params);
+        s.post(std::move(request), client_id, req_params);
     };
 
     std::vector<std::vector<sim::CliInst>> cli_inst;
@@ -226,6 +226,8 @@ int main(int argc, char* argv[]) {
     simulation->display_stats(std::cout,
                               &test::server_data, &test::client_data,
                               server_disp_filter, client_disp_filter);
+
+    delete simulation;
 } // main
 
 

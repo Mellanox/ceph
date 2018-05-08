@@ -17,6 +17,9 @@ TYPE(compressible_bloom_filter)
 #include "test_ceph_time.h"
 TYPE(real_time_wrapper)
 
+#include "test_sstring.h"
+TYPE(sstring_wrapper)
+
 #include "common/snap_types.h"
 TYPE(SnapContext)
 TYPE(SnapRealmInfo)
@@ -70,7 +73,7 @@ TYPE(pg_info_t)
 TYPE_FEATUREFUL(pg_query_t)
 TYPE(pg_log_entry_t)
 TYPE(pg_log_t)
-TYPE(pg_missing_item)
+TYPE_FEATUREFUL(pg_missing_item)
 TYPE(pg_missing_t)
 TYPE(pg_ls_response_t)
 TYPE(pg_nls_response_t)
@@ -142,6 +145,7 @@ TYPE_FEATUREFUL(AuthMonitor::Incremental)
 #include "mon/PGMap.h"
 TYPE_FEATUREFUL(PGMap::Incremental)
 TYPE_FEATUREFUL_NONDETERMINISTIC(PGMap)
+TYPE_FEATUREFUL_NONDETERMINISTIC(PGMapDigest)
 
 #include "mon/MonitorDBStore.h"
 TYPE(MonitorDBStore::Transaction)
@@ -161,6 +165,11 @@ TYPE(LevelDBStoreStats)
 
 #include "mon/CreatingPGs.h"
 TYPE(creating_pgs_t)
+
+#include "mgr/ServiceMap.h"
+TYPE_FEATUREFUL(ServiceMap)
+TYPE_FEATUREFUL(ServiceMap::Service)
+TYPE_FEATUREFUL(ServiceMap::Daemon)
 
 #include "os/filestore/DBObjectMap.h"
 TYPE(DBObjectMap::_Header)
@@ -333,9 +342,19 @@ TYPE(rgw_cls_read_olh_log_ret)
 TYPE(rgw_cls_trim_olh_log_op)
 TYPE(rgw_cls_bucket_clear_olh_op)
 TYPE(rgw_cls_check_index_ret)
+TYPE(cls_rgw_reshard_add_op)
+TYPE(cls_rgw_reshard_list_op)
+TYPE(cls_rgw_reshard_list_ret)
+TYPE(cls_rgw_reshard_get_op)
+TYPE(cls_rgw_reshard_get_ret)
+TYPE(cls_rgw_reshard_remove_op)
+TYPE(cls_rgw_set_bucket_resharding_op)
+TYPE(cls_rgw_clear_bucket_resharding_op)
 
 #include "cls/rgw/cls_rgw_client.h"
 TYPE(rgw_bi_log_entry)
+TYPE(cls_rgw_reshard_entry)
+TYPE(cls_rgw_bucket_instance_entry)
 
 #include "cls/user/cls_user_types.h"
 TYPE(cls_user_bucket)
@@ -370,6 +389,18 @@ TYPE(rgw_obj)
 #include "rgw/rgw_log.h"
 TYPE(rgw_log_entry)
 
+#include "rgw/rgw_sync.h"
+TYPE(rgw_meta_sync_info)
+TYPE(rgw_meta_sync_marker)
+TYPE(rgw_meta_sync_status)
+
+#include "rgw/rgw_data_sync.h"
+TYPE(rgw_data_sync_info)
+TYPE(rgw_data_sync_marker)
+TYPE(rgw_data_sync_status)
+
+#endif
+
 #ifdef WITH_RBD
 #include "cls/rbd/cls_rbd.h"
 TYPE(cls_rbd_parent)
@@ -380,11 +411,10 @@ TYPE(cls::rbd::MirrorPeer)
 TYPE(cls::rbd::MirrorImage)
 #endif
 
-#endif
-
 #include "cls/lock/cls_lock_types.h"
 TYPE(rados::cls::lock::locker_id_t)
 TYPE_FEATUREFUL(rados::cls::lock::locker_info_t)
+TYPE_FEATUREFUL(rados::cls::lock::lock_info_t)
 
 #include "cls/lock/cls_lock_ops.h"
 TYPE(cls_lock_lock_op)
@@ -573,6 +603,10 @@ MESSAGE(MOSDPGNotify)
 MESSAGE(MOSDPGQuery)
 #include "messages/MOSDPGRemove.h"
 MESSAGE(MOSDPGRemove)
+#include "messages/MOSDPGRecoveryDelete.h"
+MESSAGE(MOSDPGRecoveryDelete)
+#include "messages/MOSDPGRecoveryDeleteReply.h"
+MESSAGE(MOSDPGRecoveryDeleteReply)
 #include "messages/MOSDPGScan.h"
 MESSAGE(MOSDPGScan)
 #include "messages/MOSDPGTemp.h"
@@ -585,6 +619,8 @@ MESSAGE(MOSDPing)
 MESSAGE(MOSDRepScrub)
 #include "messages/MOSDScrub.h"
 MESSAGE(MOSDScrub)
+#include "messages/MOSDForceRecovery.h"
+MESSAGE(MOSDForceRecovery)
 #include "messages/MOSDSubOp.h"
 MESSAGE(MOSDSubOp)
 #include "messages/MOSDSubOpReply.h"

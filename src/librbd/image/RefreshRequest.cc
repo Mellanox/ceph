@@ -1,6 +1,9 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include <boost/algorithm/string/predicate.hpp>
+#include "include/assert.h"
+
 #include "librbd/image/RefreshRequest.h"
 #include "common/dout.h"
 #include "common/errno.h"
@@ -21,6 +24,12 @@
 
 namespace librbd {
 namespace image {
+
+namespace {
+
+const uint64_t MAX_METADATA_ITEMS = 128;
+
+}
 
 using util::create_rados_callback;
 using util::create_async_context_callback;
@@ -284,6 +293,59 @@ Context *RefreshRequest<I>::handle_v2_get_mutable_metadata(int *result) {
     m_features |= RBD_FEATURE_EXCLUSIVE_LOCK;
     m_incomplete_update = true;
   }
+
+  send_v2_get_metadata();
+  return nullptr;
+}
+
+template <typename I>
+void RefreshRequest<I>::send_v2_get_metadata() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << ": "
+                 << "start_key=" << m_last_metadata_key << dendl;
+
+  librados::ObjectReadOperation op;
+  cls_client::metadata_list_start(&op, m_last_metadata_key, MAX_METADATA_ITEMS);
+
+  using klass = RefreshRequest<I>;
+  librados::AioCompletion *comp =
+    create_rados_callback<klass, &klass::handle_v2_get_metadata>(this);
+  m_out_bl.clear();
+  m_image_ctx.md_ctx.aio_operate(m_image_ctx.header_oid, comp, &op,
+                                  &m_out_bl);
+  comp->release();
+}
+
+template <typename I>
+Context *RefreshRequest<I>::handle_v2_get_metadata(int *result) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << ": r=" << *result << dendl;
+
+  std::map<std::string, bufferlist> metadata;
+  if (*result == 0) {
+    bufferlist::iterator it = m_out_bl.begin();
+    *result = cls_client::metadata_list_finish(&it, &metadata);
+  }
+
+  if (*result == -EOPNOTSUPP || *result == -EIO) {
+    ldout(cct, 10) << "config metadata not supported by OSD" << dendl;
+  } else if (*result < 0) {
+    lderr(cct) << "failed to retrieve metadata: " << cpp_strerror(*result)
+               << dendl;
+    return m_on_finish;
+  }
+
+  if (!metadata.empty()) {
+    m_metadata.insert(metadata.begin(), metadata.end());
+    m_last_metadata_key = metadata.rbegin()->first;
+    if (boost::starts_with(m_last_metadata_key,
+                           ImageCtx::METADATA_CONF_PREFIX)) {
+      send_v2_get_metadata();
+      return nullptr;
+    }
+  }
+
+  m_image_ctx.apply_metadata(m_metadata, false);
 
   send_v2_get_flags();
   return nullptr;
@@ -644,7 +706,8 @@ void RefreshRequest<I>::send_v2_open_journal() {
         !journal_disabled_by_policy &&
         m_image_ctx.exclusive_lock != nullptr &&
         m_image_ctx.journal == nullptr) {
-      m_image_ctx.io_work_queue->set_require_lock_on_read();
+      m_image_ctx.io_work_queue->set_require_lock(librbd::io::DIRECTION_BOTH,
+                                                  true);
     }
     send_v2_block_writes();
     return;
@@ -1077,7 +1140,6 @@ void RefreshRequest<I>::apply() {
       // object map and journaling
       assert(m_exclusive_lock == nullptr);
       m_exclusive_lock = m_image_ctx.exclusive_lock;
-      m_image_ctx.io_work_queue->clear_require_lock_on_read();
     } else {
       if (m_exclusive_lock != nullptr) {
         assert(m_image_ctx.exclusive_lock == nullptr);
@@ -1085,8 +1147,9 @@ void RefreshRequest<I>::apply() {
       }
       if (!m_image_ctx.test_features(RBD_FEATURE_JOURNALING,
                                      m_image_ctx.snap_lock)) {
-        if (m_image_ctx.journal != nullptr) {
-          m_image_ctx.io_work_queue->clear_require_lock_on_read();
+        if (!m_image_ctx.clone_copy_on_read && m_image_ctx.journal != nullptr) {
+          m_image_ctx.io_work_queue->set_require_lock(io::DIRECTION_READ,
+                                                      false);
         }
         std::swap(m_journal, m_image_ctx.journal);
       } else if (m_journal != nullptr) {
@@ -1096,10 +1159,6 @@ void RefreshRequest<I>::apply() {
                                      m_image_ctx.snap_lock) ||
           m_object_map != nullptr) {
         std::swap(m_object_map, m_image_ctx.object_map);
-      }
-      if (m_image_ctx.clone_copy_on_read &&
-          m_image_ctx.io_work_queue->is_lock_required()) {
-        m_image_ctx.io_work_queue->set_require_lock_on_read();
       }
     }
   }

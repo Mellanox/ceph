@@ -13,9 +13,7 @@
 #include <string>
 
 class Context;
-class ContextWQ;
 class Mutex;
-class SafeTimer;
 
 namespace journal {
 
@@ -140,14 +138,20 @@ struct MockJournaler {
 };
 
 struct MockJournalerProxy {
+  MockJournalerProxy() {
+    MockJournaler::get_instance().construct();
+  }
+
   template <typename IoCtxT>
   MockJournalerProxy(IoCtxT &header_ioctx, const std::string &,
                      const std::string &, const Settings&) {
     MockJournaler::get_instance().construct();
   }
 
-  MockJournalerProxy(ContextWQ *work_queue, SafeTimer *timer, Mutex *timer_lock,
-                     librados::IoCtx &header_ioctx, const std::string &journal_id,
+  template <typename WorkQueue, typename Timer>
+  MockJournalerProxy(WorkQueue *work_queue, Timer *timer, Mutex *timer_lock,
+                     librados::IoCtx &header_ioctx,
+                     const std::string &journal_id,
                      const std::string &client_id, const Settings&) {
     MockJournaler::get_instance().construct();
   }

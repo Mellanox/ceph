@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env python
 #
 # Copyright (C) 2015, 2016 Red Hat <contact@redhat.com>
 #
@@ -45,7 +45,65 @@ class Base(object):
 
 class TestPrepare(Base):
 
-    def test_init_dir(self):
+    @mock.patch('ceph_disk.main.get_fsid')
+    def test_init_filestore_dir(self, m_get_fsid):
+        parser = argparse.ArgumentParser('ceph-disk')
+        subparsers = parser.add_subparsers()
+        main.Prepare.set_subparser(subparsers)
+
+        data = tempfile.mkdtemp()
+        main.setup_statedir(data)
+        args = parser.parse_args([
+            'prepare',
+            data,
+            '--filestore',
+        ])
+
+        def set_type(self):
+            self.type = self.FILE
+        m_get_fsid.return_value = '571bb920-6d85-44d7-9eca-1bc114d1cd75'
+        with mock.patch.multiple(main.PrepareData,
+                                 set_type=set_type):
+            prepare = main.Prepare.factory(args)
+        prepare = main.Prepare.factory(args)
+        assert isinstance(prepare.data, main.PrepareFilestoreData)
+        assert prepare.data.is_file()
+        assert isinstance(prepare.journal, main.PrepareJournal)
+        assert prepare.journal.is_none()
+        prepare.prepare()
+        assert os.path.exists(os.path.join(data, 'fsid'))
+        shutil.rmtree(data)
+
+    @mock.patch('stat.S_ISBLK')
+    @mock.patch('ceph_disk.main.is_partition')
+    @mock.patch('ceph_disk.main.get_fsid')
+    def test_init_filestore_dev(self,
+                                m_get_fsid,
+                                m_is_partition,
+                                m_s_isblk):
+        m_s_isblk.return_value = True
+
+        parser = argparse.ArgumentParser('ceph-disk')
+        subparsers = parser.add_subparsers()
+        main.Prepare.set_subparser(subparsers)
+
+        m_is_partition.return_value = False
+        _, data = tempfile.mkstemp()
+
+        args = parser.parse_args([
+            'prepare',
+            data,
+            '--filestore',
+        ])
+        m_get_fsid.return_value = '571bb920-6d85-44d7-9eca-1bc114d1cd75'
+        prepare = main.Prepare.factory(args)
+        assert isinstance(prepare.data, main.PrepareData)
+        assert prepare.data.is_device()
+        assert isinstance(prepare.journal, main.PrepareJournal)
+        assert prepare.journal.is_device()
+
+    @mock.patch('ceph_disk.main.get_fsid')
+    def test_init_default_dir(self, m_get_fsid):
         parser = argparse.ArgumentParser('ceph-disk')
         subparsers = parser.add_subparsers()
         main.Prepare.set_subparser(subparsers)
@@ -59,38 +117,15 @@ class TestPrepare(Base):
 
         def set_type(self):
             self.type = self.FILE
+        m_get_fsid.return_value = '571bb920-6d85-44d7-9eca-1bc114d1cd75'
         with mock.patch.multiple(main.PrepareData,
                                  set_type=set_type):
             prepare = main.Prepare.factory(args)
-        assert isinstance(prepare.data, main.PrepareFilestoreData)
+        assert isinstance(prepare.data, main.PrepareBluestoreData)
         assert prepare.data.is_file()
-        assert isinstance(prepare.journal, main.PrepareJournal)
-        assert prepare.journal.is_none()
         prepare.prepare()
         assert os.path.exists(os.path.join(data, 'fsid'))
         shutil.rmtree(data)
-
-    @mock.patch('stat.S_ISBLK')
-    @mock.patch('ceph_disk.main.is_partition')
-    def test_init_dev(self, m_is_partition, m_s_isblk):
-        m_s_isblk.return_value = True
-
-        parser = argparse.ArgumentParser('ceph-disk')
-        subparsers = parser.add_subparsers()
-        main.Prepare.set_subparser(subparsers)
-
-        m_is_partition.return_value = False
-        _, data = tempfile.mkstemp()
-
-        args = parser.parse_args([
-            'prepare',
-            data,
-        ])
-        prepare = main.Prepare.factory(args)
-        assert isinstance(prepare.data, main.PrepareData)
-        assert prepare.data.is_device()
-        assert isinstance(prepare.journal, main.PrepareJournal)
-        assert prepare.journal.is_device()
 
     def test_set_subparser(self):
         parser = argparse.ArgumentParser('ceph-disk')
@@ -351,7 +386,8 @@ class TestCryptHelpers(Base):
 
 class TestPrepareData(Base):
 
-    def test_set_variables(self):
+    @mock.patch('ceph_disk.main.get_fsid')
+    def test_set_variables(self, m_get_fsid):
         parser = argparse.ArgumentParser('ceph-disk')
         subparsers = parser.add_subparsers()
         main.Prepare.set_subparser(subparsers)
@@ -368,6 +404,7 @@ class TestPrepareData(Base):
 
         def set_type(self):
             self.type = self.FILE
+        m_get_fsid.return_value = cluster_uuid
         with mock.patch.multiple(main.PrepareData,
                                  set_type=set_type):
             data = main.PrepareData(args)
@@ -398,3 +435,37 @@ class TestPrepareData(Base):
                                  set_type=set_type):
             data = main.PrepareData(args)
         assert data.args.cluster_uuid == cluster_uuid
+
+
+class TestSecrets(Base):
+
+    @mock.patch('ceph_disk.main.command')
+    def test_secrets(self, m_command):
+        key = "KEY"
+        m_command.side_effect = lambda cmd: (key + "\n", '', 0)
+        s = main.Secrets()
+        assert {"cephx_secret": key} == s.keys
+        assert '{"cephx_secret": "' + key + '"}' == s.get_json()
+
+    @mock.patch('ceph_disk.main.open')
+    @mock.patch('ceph_disk.main.CryptHelpers.get_dmcrypt_keysize')
+    @mock.patch('ceph_disk.main.command')
+    def test_lockbox_secrets(self,
+                             m_command,
+                             m_get_dmcrypt_keysize,
+                             m_open):
+        key = "KEY"
+        m_command.side_effect = lambda cmd: (key + "\n", '', 0)
+        m_get_dmcrypt_keysize.side_effect = lambda args: 32
+
+        class File:
+            def read(self, size):
+                return b'O' * size
+
+        m_open.side_effect = lambda path, mode: File()
+        s = main.LockboxSecrets({})
+        assert {
+            "dmcrypt_key": 'T09PTw==',
+            "cephx_secret": key,
+            "cephx_lockbox_secret": key,
+        } == s.keys

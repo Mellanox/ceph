@@ -169,8 +169,8 @@ http and https, you must pick only one.  So::
 Migrating from Apache to Civetweb
 ---------------------------------
 
-If you're running the Ceph Object Gateway on Apache and FastCGI with Ceph
-Storage v0.80 or above, you're already running Civetweb--it starts with the
+If you are running the Ceph Object Gateway on Apache and FastCGI with Ceph
+Storage v0.80 or above, you are already running Civetweb--it starts with the
 ``ceph-radosgw`` daemon and it's running on port 7480 by default so that it
 doesn't conflict with your Apache and FastCGI installation and other commonly
 used web service ports. Migrating to use Civetweb basically involves removing
@@ -265,26 +265,25 @@ On Ubuntu execute::
  sudo service radosgw restart id=rgw.<short-hostname>
 
 For federated configurations, each zone may have a different ``index_pool``
-setting for failover. To make the value consistent for a region's zones, you
-may set ``rgw_override_bucket_index_max_shards`` in a gateway's region
+setting for failover. To make the value consistent for a zonegroup's zones, you
+may set ``rgw_override_bucket_index_max_shards`` in a gateway's zonegroup
 configuration. For example::
 
-  radosgw-admin region get > region.json
+  radosgw-admin zonegroup get > zonegroup.json
 
-Open the ``region.json`` file and edit the ``bucket_index_max_shards`` setting
-for each named zone. Save the ``region.json`` file and reset the region. For
-example::
+Open the ``zonegroup.json`` file and edit the ``bucket_index_max_shards`` setting
+for each named zone. Save the ``zonegroup.json`` file and reset the zonegroup.
+For example::
 
-   radosgw-admin region set < region.json
+   radosgw-admin zonegroup set < zonegroup.json
 
-Once you've updated your region, update the region map. For example::
+Once you have updated your zonegroup, update and commit the period.
+For example::
 
-   radosgw-admin regionmap update --name client.rgw.ceph-client
-
-Where ``client.rgw.ceph-client`` is the name of the gateway user.
+   radosgw-admin period update --commit
 
 .. note:: Mapping the index pool (for each zone, if applicable) to a CRUSH
-          ruleset of SSD-based OSDs may also help with bucket index performance.
+          rule of SSD-based OSDs may also help with bucket index performance.
 
 Add Wildcard to DNS
 -------------------

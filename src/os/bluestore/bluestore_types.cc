@@ -47,22 +47,26 @@ void bluestore_bdev_label_t::encode(bufferlist& bl) const
   bl.append("bluestore block device\n");
   bl.append(stringify(osd_uuid));
   bl.append("\n");
-  ENCODE_START(1, 1, bl);
+  ENCODE_START(2, 1, bl);
   ::encode(osd_uuid, bl);
   ::encode(size, bl);
   ::encode(btime, bl);
   ::encode(description, bl);
+  ::encode(meta, bl);
   ENCODE_FINISH(bl);
 }
 
 void bluestore_bdev_label_t::decode(bufferlist::iterator& p)
 {
   p.advance(60); // see above
-  DECODE_START(1, p);
+  DECODE_START(2, p);
   ::decode(osd_uuid, p);
   ::decode(size, p);
   ::decode(btime, p);
   ::decode(description, p);
+  if (struct_v >= 2) {
+    ::decode(meta, p);
+  }
   DECODE_FINISH(p);
 }
 
@@ -72,6 +76,9 @@ void bluestore_bdev_label_t::dump(Formatter *f) const
   f->dump_unsigned("size", size);
   f->dump_stream("btime") << btime;
   f->dump_string("description", description);
+  for (auto& i : meta) {
+    f->dump_string(i.first.c_str(), i.second);
+  }
 }
 
 void bluestore_bdev_label_t::generate_test_instances(
@@ -82,14 +89,17 @@ void bluestore_bdev_label_t::generate_test_instances(
   o.back()->size = 123;
   o.back()->btime = utime_t(4, 5);
   o.back()->description = "fakey";
+  o.back()->meta["foo"] = "bar";
 }
 
 ostream& operator<<(ostream& out, const bluestore_bdev_label_t& l)
 {
   return out << "bdev(osd_uuid " << l.osd_uuid
-	     << " size 0x" << std::hex << l.size << std::dec
-	     << " btime " << l.btime
-	     << " desc " << l.description << ")";
+	     << ", size 0x" << std::hex << l.size << std::dec
+	     << ", btime " << l.btime
+	     << ", desc " << l.description
+	     << ", " << l.meta.size() << " meta"
+	     << ")";
 }
 
 // cnode_t
@@ -196,10 +206,11 @@ void bluestore_extent_ref_map_t::get(uint64_t offset, uint32_t length)
 
 void bluestore_extent_ref_map_t::put(
   uint64_t offset, uint32_t length,
-  PExtentVector *release)
+  PExtentVector *release,
+  bool *maybe_unshared)
 {
   //NB: existing entries in 'release' container must be preserved!
-
+  bool unshared = true;
   auto p = ref_map.lower_bound(offset);
   if (p == ref_map.end() || p->first > offset) {
     if (p == ref_map.begin()) {
@@ -213,30 +224,42 @@ void bluestore_extent_ref_map_t::put(
   if (p->first < offset) {
     uint64_t left = p->first + p->second.length - offset;
     p->second.length = offset - p->first;
+    if (p->second.refs != 1) {
+      unshared = false;
+    }
     p = ref_map.insert(map<uint64_t,record_t>::value_type(
 			 offset, record_t(left, p->second.refs))).first;
   }
   while (length > 0) {
     assert(p->first == offset);
     if (length < p->second.length) {
+      if (p->second.refs != 1) {
+	unshared = false;
+      }
       ref_map.insert(make_pair(offset + length,
 			       record_t(p->second.length - length,
 					p->second.refs)));
       if (p->second.refs > 1) {
 	p->second.length = length;
 	--p->second.refs;
+	if (p->second.refs != 1) {
+	  unshared = false;
+	}
 	_maybe_merge_left(p);
       } else {
 	if (release)
 	  release->push_back(bluestore_pextent_t(p->first, length));
 	ref_map.erase(p);
       }
-      return;
+      goto out;
     }
     offset += p->second.length;
     length -= p->second.length;
     if (p->second.refs > 1) {
       --p->second.refs;
+      if (p->second.refs != 1) {
+	unshared = false;
+      }
       _maybe_merge_left(p);
       ++p;
     } else {
@@ -248,6 +271,19 @@ void bluestore_extent_ref_map_t::put(
   if (p != ref_map.end())
     _maybe_merge_left(p);
   //_check();
+out:
+  if (maybe_unshared) {
+    if (unshared) {
+      // we haven't seen a ref != 1 yet; check the whole map.
+      for (auto& p : ref_map) {
+	if (p.second.refs != 1) {
+	  unshared = false;
+	  break;
+	}
+      }
+    }
+    *maybe_unshared = unshared;
+  }
 }
 
 bool bluestore_extent_ref_map_t::contains(uint64_t offset, uint32_t length) const
@@ -569,9 +605,6 @@ void bluestore_pextent_t::generate_test_instances(list<bluestore_pextent_t*>& ls
 string bluestore_blob_t::get_flags_string(unsigned flags)
 {
   string s;
-  if (flags & FLAG_MUTABLE) {
-    s = "mutable";
-  }
   if (flags & FLAG_COMPRESSED) {
     if (s.length())
       s += '+';
@@ -651,7 +684,7 @@ ostream& operator<<(ostream& out, const bluestore_blob_t& o)
   if (o.flags) {
     out << " " << o.get_flags_string();
   }
-  if (o.csum_type) {
+  if (o.has_csum()) {
     out << " " << Checksummer::get_csum_type_string(o.csum_type)
 	<< "/0x" << std::hex << (1ull << o.csum_chunk_order) << std::dec;
   }
@@ -758,6 +791,7 @@ void bluestore_blob_t::allocated(uint32_t b_off, uint32_t length, const AllocExt
     auto start_it = extents.begin();
     size_t pos = 0;
     while(true) {
+      assert(start_it != extents.end());
       if (cur_offs + start_it->length > b_off) {
 	break;
       }
@@ -770,6 +804,7 @@ void bluestore_blob_t::allocated(uint32_t b_off, uint32_t length, const AllocExt
     auto end_it = start_it;
 
     while (true) {
+      assert(end_it != extents.end());
       assert(!end_it->is_valid());
       if (cur_offs + end_it->length >= end_off) {
 	break;
@@ -995,8 +1030,8 @@ void bluestore_shared_blob_t::generate_test_instances(
 
 ostream& operator<<(ostream& out, const bluestore_shared_blob_t& sb)
 {
-  out << " sbid 0x" << std::hex << sb.sbid << std::dec;
-  out << " ref_map(" << sb.ref_map << ")";
+  out << "(sbid 0x" << std::hex << sb.sbid << std::dec;
+  out << " " << sb.ref_map << ")";
   return out;
 }
 

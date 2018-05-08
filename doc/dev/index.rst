@@ -49,16 +49,16 @@ their nicks on `GitHub`_:
 
 .. _github: https://github.com/
 
-========= =============== =============
-Scope     Lead            GitHub nick
-========= =============== =============
-Ceph      Sage Weil       liewegas
-RADOS     Samuel Just     athanatos
-RGW       Yehuda Sadeh    yehudasa
-RBD       Jason Dillaman  dillaman
-CephFS    John Spray      jcsp
-Build/Ops Ken Dreyer      ktdreyer
-========= =============== =============
+========= ================ =============
+Scope     Lead             GitHub nick
+========= ================ =============
+Ceph      Sage Weil        liewegas
+RADOS     Samuel Just      athanatos
+RGW       Yehuda Sadeh     yehudasa
+RBD       Jason Dillaman   dillaman
+CephFS    Patrick Donnelly batrick
+Build/Ops Ken Dreyer       ktdreyer
+========= ================ =============
 
 The Ceph-specific acronyms in the table are explained in
 :doc:`/architecture`.
@@ -135,7 +135,7 @@ in the body of the message.
 
 There are also `other Ceph-related mailing lists`_.
 
-.. _`other Ceph-related mailing lists`: https://ceph.com/resources/mailing-list-irc/
+.. _`other Ceph-related mailing lists`: https://ceph.com/irc/
 
 IRC
 ---
@@ -145,7 +145,7 @@ time using `Internet Relay Chat`_.
 
 .. _`Internet Relay Chat`: http://www.irchelp.org/
 
-See https://ceph.com/resources/mailing-list-irc/ for how to set up your IRC
+See https://ceph.com/irc/ for how to set up your IRC
 client and a list of channels.
 
 Submitting patches
@@ -215,6 +215,12 @@ The rest (including the actual backporting) will be taken care of by the
 
 .. _`tracker issue`: http://tracker.ceph.com/
 .. _`Stable Releases and Backports`: http://tracker.ceph.com/projects/ceph-releases/wiki
+
+Guidance for use of cluster log
+-------------------------------
+
+If your patches emit messages to the Ceph cluster log, please consult
+this guidance: :doc:`/dev/logging`.
 
 
 What is merged where and when ?
@@ -589,15 +595,38 @@ When your PR hits GitHub, the Ceph project's `Continuous Integration (CI)
 infrastructure will test it automatically. At the time of this writing
 (March 2016), the automated CI testing included a test to check that the
 commits in the PR are properly signed (see `Submitting patches`_) and a
-``make check`` test.
+`make check`_ test.
 
-The latter, ``make check``, builds the PR and runs it through a battery of
+The latter, `make check`_, builds the PR and runs it through a battery of
 tests. These tests run on machines operated by the Ceph Continuous
 Integration (CI) team. When the tests complete, the result will be shown
 on GitHub in the pull request itself.
 
 You can (and should) also test your modifications before you open a PR. 
 Refer to the `Testing`_ chapter for details.
+
+Notes on PR make check test
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The GitHub `make check`_ test is driven by a Jenkins instance.
+
+Jenkins merges the PR branch into the latest version of the base branch before
+starting the build, so you don't have to rebase the PR to pick up any fixes.
+
+You can trigger the PR tests at any time by adding a comment to the PR - the
+comment should contain the string "test this please". Since a human subscribed
+to the PR might interpret that as a request for him or her to test the PR, it's
+good to write the request as "Jenkins, test this please".
+
+The `make check`_ log is the place to go if there is a failure and you're not
+sure what caused it. To reach it, first click on "details" (next to the `make
+check`_ test in the PR) to get into the Jenkins web GUI, and then click on
+"Console Output" (on the left).
+
+Jenkins is set up to grep the log for strings known to have been associated
+with `make check`_ failures in the past. However, there is no guarantee that
+the strings are associated with any given `make check`_ failure. You have to
+dig into the log to be sure.
 
 Integration tests AKA ceph-qa-suite
 -----------------------------------
@@ -669,26 +698,28 @@ flagged for backporting, in which case the status should be changed to
 Testing
 =======
 
-Ceph has two types of tests: "make check" tests and integration tests.
+Ceph has two types of tests: `make check`_ tests and integration tests.
 The former are run via `GNU Make <https://www.gnu.org/software/make/>`,
 and the latter are run via the `teuthology framework`_. The following two
-chapters examine the "make check" and integration tests in detail.
+chapters examine the `make check`_ and integration tests in detail.
+
+.. _`make check`:
 
 Testing - make check
 ====================
 
-After compiling Ceph, the ``make check`` command can be used to run the
+After compiling Ceph, the `make check`_ command can be used to run the
 code through a battery of tests covering various aspects of Ceph. For
-inclusion in "make check", a test must:
+inclusion in `make check`_, a test must:
 
 * bind ports that do not conflict with other tests
 * not require root access
 * not require more than one machine to run
 * complete within a few minutes
 
-While it is possible to run ``make check`` directly, it can be tricky to
+While it is possible to run `make check`_ directly, it can be tricky to
 correctly set up your environment. Fortunately, a script is provided to
-make it easier run "make check" on your code. It can be run from the
+make it easier run `make check`_ on your code. It can be run from the
 top-level directory of the Ceph source tree by doing::
 
     $ ./run-make-check.sh
@@ -698,15 +729,13 @@ command to complete successfully on x86_64 (other architectures may have
 different constraints). Depending on your hardware, it can take from 20
 minutes to three hours to complete, but it's worth the wait.
 
-Future sections
----------------
+Caveats
+-------
 
-* Principles of make check tests
-* Where to find test results
-* How to interpret test results
-* Find the corresponding source code
-* Writing make check tests
-* Make check caveats
+1. Unlike the various Ceph daemons and ``ceph-fuse``, the `make check`_ tests
+   are linked against the default memory allocator (glibc) unless explicitly
+   linked against something else. This enables tools like valgrind to be used
+   in the tests.
 
 Testing - integration tests
 ===========================
@@ -750,7 +779,7 @@ The results of the nightlies are published at http://pulpito.ceph.com/ and
 http://pulpito.ovh.sepia.ceph.com:8081/. The developer nick shows in the
 test results URL and in the first column of the Pulpito dashboard.  The
 results are also reported on the `ceph-qa mailing list
-<http://ceph.com/resources/mailing-list-irc/>`_ for analysis.
+<https://ceph.com/irc/>`_ for analysis.
 
 Suites inventory
 ----------------
@@ -1132,11 +1161,14 @@ Reducing the number of tests
 ----------------------------
 
 The ``rados`` suite generates thousands of tests out of a few hundred
-files. For instance, all tests in the `rados/thrash suite
-<https://github.com/ceph/ceph/tree/master/qa/suites/rados/thrash>`_
-run for ``xfs``, ``btrfs`` and ``ext4`` because they are combined (via
-special file ``%``) with the `fs directory
-<https://github.com/ceph/ceph/tree/master/qa/suites/rados/thrash/fs>`_
+files. This happens because teuthology constructs test matrices from
+subdirectories wherever it encounters a file named ``%``. For instance,
+all tests in the `rados/basic suite
+<https://github.com/ceph/ceph/tree/master/qa/suites/rados/basic>`_
+run with different messenger types: ``simple``, ``async`` and
+``random``, because they are combined (via the special file ``%``) with
+the `msgr directory
+<https://github.com/ceph/ceph/tree/master/qa/suites/rados/basic/msgr>`_
 
 All integration tests are required to be run before a Ceph release is published. 
 When merely verifying whether a contribution can be merged without
@@ -1146,7 +1178,7 @@ reduce the number of tests that are triggered. For instance::
   teuthology-suite --suite rados --subset 0/4000
 
 will run as few tests as possible. The tradeoff in this case is that
-some tests will only run on ``xfs`` and not on ``ext4`` or ``btrfs``,
+not all combinations of test variations will together,
 but no matter how small a ratio is provided in the ``--subset``,
 teuthology will still ensure that all files in the suite are in at
 least one test. Understanding the actual logic that drives this
@@ -1199,9 +1231,9 @@ Getting ceph-workbench
 Since testing in the cloud is done using the `ceph-workbench
 ceph-qa-suite`_ tool, you will need to install that first. It is designed
 to be installed via Docker, so if you don't have Docker running on your
-development machine, take care of that first. The Docker project has a good
-tutorial called `Get Started with Docker Engine for Linux
-<https://docs.docker.com/linux/>`_ if you unsure how to proceed.
+development machine, take care of that first. You can follow `the official
+tutorial <https://docs.docker.com/engine/installation/>`_ to install if
+you have not installed yet.
 
 Once Docker is up and running, install ``ceph-workbench`` by following the
 `Installation instructions in the ceph-workbench documentation
@@ -1430,32 +1462,18 @@ The following instructions should work on jewel and above.
 Step 1 - build Ceph
 -------------------
 
-Refer to :doc:`install/build-ceph`.
+Refer to :doc:`/install/build-ceph`.
 
 You can do step 2 separately while it is building.
 
-Step 2 - s3-tests
------------------
-
-The test suite is in a separate git repo, and is written in python. Perform the
-following steps for jewel::
-
-    git clone git://github.com/ceph/s3-tests
-    cd s3-tests
-    git checkout ceph-jewel
-    ./bootstrap
-
-For kraken, checkout the ``ceph-kraken`` branch instead of ``ceph-jewel``. For
-master, use ``ceph-master``.
-
-Step 3 - vstart
+Step 2 - vstart
 ---------------
 
 When the build completes, and still in the top-level directory of the git
-clone where you built Ceph, do the following::
+clone where you built Ceph, do the following, for cmake builds::
 
-    cd src/
-    ./vstart.sh -n -r --mds_num 0
+    cd build/
+    RGW=1 ../vstart.sh -n
 
 This will produce a lot of output as the vstart cluster is started up. At the
 end you should see a message like::
@@ -1464,51 +1482,13 @@ end you should see a message like::
 
 This means the cluster is running.
 
-Step 4 - prepare S3 environment
--------------------------------
 
-The s3-tests suite expects to run in a particular environment (S3 users, keys,
-configuration file).
-
-Before you try to prepare the environment, make sure you don't have any
-existing keyring or ``ceph.conf`` files in ``/etc/ceph``.
-
-For jewel, Abhishek Lekshmanan wrote a script that can be used for this
-purpose. Assuming you are testing jewel, run the following commands from the
-``src/`` directory of your ceph clone (where you just started the vstart
-cluster)::
-
-    pushd ~
-    wget https://gist.githubusercontent.com/theanalyst/2fee6bc2780f67c79cad7802040fcddc/raw/b497ddba053d9a6fb5d91b73924cbafcfc32f137/s3tests-bootstrap.sh
-    popd
-    sh ~/s3tests-bootstrap.sh
-
-If the script is successful, it will display a blob of JSON and create a file
-called ``s3.conf`` in the current directory.
-
-Step 5 - run s3-tests
+Step 3 - run s3-tests
 ---------------------
 
-To actually run the tests, take note of the full path to the ``s3.conf`` file
-created in the previous step and then move to the directory where you cloned
-``s3-tests`` in Step 2.
+To run the s3tests suite do the following::
 
-First, verify that the test suite is there and can be run::
-
-    S3TEST_CONF=/path/to/s3.conf ./virtualenv/bin/nosetests -a '!fails_on_rgw' -v --collect-only
-
-This should complete quickly - it is like a "dry run" of all the tests in the
-suite.
-
-Finally, run the test suite itself::
-
-    S3TEST_CONF=/path/to/s3.conf ./virtualenv/bin/nosetests -a '!fails_on_rgw' -v
-
-Note: the following test is expected to error - this is a problem in the test
-setup (WIP), not an actual test failure::
-
-    ERROR: s3tests.functional.test_s3.test_bucket_acl_grant_email
-
+   $ ../qa/workunits/rgw/run-s3tests.sh
 
 .. WIP
 .. ===

@@ -39,12 +39,12 @@ void RGWLoadGenProcess::run()
 
   vector<string> buckets(num_buckets);
 
-  std::atomic<long int> failed = { 0 };
+  std::atomic<bool> failed = { false };
 
   for (i = 0; i < num_buckets; i++) {
     buckets[i] = "/loadgen";
     string& bucket = buckets[i];
-    append_rand_alpha(NULL, bucket, bucket, 16);
+    append_rand_alpha(cct, bucket, bucket, 16);
 
     /* first create a bucket */
     gen_request("PUT", bucket, 0, &failed);
@@ -60,7 +60,7 @@ void RGWLoadGenProcess::run()
 
   for (i = 0; i < num_objs; i++) {
     char buf[16 + 1];
-    gen_rand_alphanumeric(NULL, buf, sizeof(buf));
+    gen_rand_alphanumeric(cct, buf, sizeof(buf));
     buf[16] = '\0';
     objs[i] = buckets[i % num_buckets] + "/" + buf;
   }
@@ -104,7 +104,7 @@ done:
 
 void RGWLoadGenProcess::gen_request(const string& method,
 				    const string& resource,
-				    int content_length, std::atomic<long int>* fail_flag)
+				    int content_length, std::atomic<bool>* fail_flag)
 {
   RGWLoadGenRequest* req =
     new RGWLoadGenRequest(store->get_new_req_id(), method, resource,
@@ -131,7 +131,7 @@ void RGWLoadGenProcess::handle_request(RGWRequest* r)
   env.sign(access_key);
 
   RGWLoadGenIO real_client_io(&env);
-  RGWRestfulIO client_io(&real_client_io);
+  RGWRestfulIO client_io(cct, &real_client_io);
 
   int ret = process_request(store, rest, req, uri_prefix,
                             *auth_registry, &client_io, olog);

@@ -12,8 +12,8 @@
 
 #include "librbd/ImageCtx.h"
 #include "librbd/internal.h"
-
 #include "librbd/Journal.h"
+#include "librbd/Types.h"
 
 #ifdef WITH_LTTNG
 #include "tracing/librbd.h"
@@ -74,6 +74,8 @@ void AioCompletion::complete() {
     ictx->perfcounter->tinc(l_librbd_aio_flush_latency, elapsed); break;
   case AIO_TYPE_WRITESAME:
     ictx->perfcounter->tinc(l_librbd_ws_latency, elapsed); break;
+  case AIO_TYPE_COMPARE_AND_WRITE:
+    ictx->perfcounter->tinc(l_librbd_cmp_latency, elapsed); break;
   default:
     lderr(cct) << "completed invalid aio_type: " << aio_type << dendl;
     break;

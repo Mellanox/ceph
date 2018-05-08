@@ -47,7 +47,7 @@ void SessionMap::register_perfcounters()
   PerfCountersBuilder plb(g_ceph_context, "mds_sessions",
       l_mdssm_first, l_mdssm_last);
   plb.add_u64(l_mdssm_session_count, "session_count",
-      "Session count");
+      "Session count", "sess", PerfCountersBuilder::PRIO_INTERESTING);
   plb.add_u64_counter(l_mdssm_session_add, "session_add",
       "Sessions added");
   plb.add_u64_counter(l_mdssm_session_remove, "session_remove",
@@ -628,6 +628,9 @@ void SessionMap::touch_session(Session *session)
 
 void SessionMap::_mark_dirty(Session *s)
 {
+  if (dirty_sessions.count(s->info.inst.name))
+    return;
+
   if (dirty_sessions.size() >= g_conf->mds_sessionmap_keys_per_op) {
     // Pre-empt the usual save() call from journal segment trim, in
     // order to avoid building up an oversized OMAP update operation
@@ -635,6 +638,7 @@ void SessionMap::_mark_dirty(Session *s)
     save(new C_MDSInternalNoop, version);
   }
 
+  null_sessions.erase(s->info.inst.name);
   dirty_sessions.insert(s->info.inst.name);
 }
 
@@ -822,7 +826,7 @@ void Session::notify_cap_release(size_t n_caps)
  * in order to generate health metrics if the session doesn't see
  * a commensurate number of calls to ::notify_cap_release
  */
-void Session::notify_recall_sent(int const new_limit)
+void Session::notify_recall_sent(const size_t new_limit)
 {
   if (recalled_at.is_zero()) {
     // Entering recall phase, set up counters so we can later

@@ -66,7 +66,10 @@
                 "ec_hash_error",
                 "ec_size_error",
                 "oi_attr_missing",
-                "oi_attr_corrupted"
+                "oi_attr_corrupted",
+                "obj_size_oi_mismatch",
+                "ss_attr_missing",
+                "ss_attr_corrupted"
               ]
             },
             "minItems": 0,
@@ -82,7 +85,8 @@
                 "omap_digest_mismatch",
                 "size_mismatch",
                 "attr_value_mismatch",
-                "attr_name_mismatch"
+                "attr_name_mismatch",
+                "snapset_inconsistency"
               ]
             },
             "minItems": 0,
@@ -103,6 +107,9 @@
                 },
                 "osd": {
                   "type": "integer"
+                },
+                "primary": {
+                  "type": "boolean"
                 },
                 "size": {
                   "type": "integer"
@@ -129,7 +136,10 @@
                       "ec_hash_error",
                       "ec_size_error",
                       "oi_attr_missing",
-                      "oi_attr_corrupted"
+                      "oi_attr_corrupted",
+                      "obj_size_oi_mismatch",
+                      "ss_attr_missing",
+                      "ss_attr_corrupted"
                     ]
                   },
                   "minItems": 0,
@@ -164,6 +174,7 @@
               },
               "required": [
                 "osd",
+                "primary",
                 "errors"
               ]
             }

@@ -5,6 +5,8 @@ from tasks.cephfs.cephfs_test_case import CephFSTestCase
 from teuthology.orchestra.run import CommandFailedError
 import errno
 import time
+import json
+
 
 class TestMisc(CephFSTestCase):
     CLIENTS_REQUIRED = 2
@@ -60,12 +62,13 @@ class TestMisc(CephFSTestCase):
 
         self.fs.put_metadata_object_raw("key", dummyfile)
 
-        timeout = 10
+        def get_pool_df(fs, name):
+            try:
+                return fs.get_pool_df(name)['objects'] > 0
+            except RuntimeError as e:
+                return False
 
-        get_pool_df = self.fs.get_pool_df
-        self.wait_until_true(
-                lambda: get_pool_df(self.fs.metadata_pool_name)['objects'] > 0,
-                timeout=timeout)
+        self.wait_until_true(lambda: get_pool_df(self.fs, self.fs.metadata_pool_name), timeout=30)
 
         try:
             self.fs.mon_manager.raw_cluster_cmd('fs', 'new', self.fs.name,
@@ -101,12 +104,12 @@ class TestMisc(CephFSTestCase):
         only session
         """
 
-        self.mount_b.umount_wait();
+        self.mount_b.umount_wait()
         ls_data = self.fs.mds_asok(['session', 'ls'])
         self.assert_session_count(1, ls_data)
 
-        self.mount_a.kill();
-        self.mount_a.kill_cleanup();
+        self.mount_a.kill()
+        self.mount_a.kill_cleanup()
 
         time.sleep(self.mds_session_autoclose * 1.5)
         ls_data = self.fs.mds_asok(['session', 'ls'])
@@ -121,10 +124,26 @@ class TestMisc(CephFSTestCase):
         self.assert_session_count(2, ls_data)
 
         self.mount_a.kill()
-        self.mount_a.kill()
-        self.mount_b.kill_cleanup()
-        self.mount_b.kill_cleanup()
+        self.mount_a.kill_cleanup()
 
         time.sleep(self.mds_session_autoclose * 1.5)
         ls_data = self.fs.mds_asok(['session', 'ls'])
         self.assert_session_count(1, ls_data)
+
+    def test_filtered_df(self):
+        pool_name = self.fs.get_data_pool_name()
+        raw_df = self.fs.get_pool_df(pool_name)
+        raw_avail = float(raw_df["max_avail"])
+        out = self.fs.mon_manager.raw_cluster_cmd('osd', 'pool', 'get',
+                                                  pool_name, 'size',
+                                                  '-f', 'json-pretty')
+        j = json.loads(out)
+        pool_size = int(j['size'])
+
+        proc = self.mount_a.run_shell(['df', '.'])
+        output = proc.stdout.getvalue()
+        fs_avail = output.split('\n')[1].split()[3]
+        fs_avail = float(fs_avail) * 1024
+
+        ratio = raw_avail / fs_avail
+        assert 0.9 < ratio < 1.1

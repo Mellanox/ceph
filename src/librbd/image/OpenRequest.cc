@@ -73,7 +73,7 @@ Context *OpenRequest<I>::handle_v1_detect_header(int *result) {
 
     m_image_ctx->old_format = true;
     m_image_ctx->header_oid = util::old_header_name(m_image_ctx->name);
-    m_image_ctx->apply_metadata({});
+    m_image_ctx->apply_metadata({}, true);
 
     send_register_watch();
   }
@@ -226,10 +226,10 @@ Context *OpenRequest<I>::handle_v2_get_name_from_trash(int *result) {
   if (*result < 0) {
     if (*result == -EOPNOTSUPP) {
       *result = -ENOENT;
-    } else if (*result == -ENOENT) {
-      lderr(cct) << "image id " << m_image_ctx->id << " does not exist in rbd "
-                 << "trash, failed to retrieve image name: "
-                 << cpp_strerror(*result) << dendl;
+    }
+    if (*result == -ENOENT) {
+      ldout(cct, 5) << "failed to retrieve name for image id "
+                    << m_image_ctx->id << dendl;
     } else {
       lderr(cct) << "failed to retreive name from trash: "
                  << cpp_strerror(*result) << dendl;
@@ -317,6 +317,45 @@ Context *OpenRequest<I>::handle_v2_get_stripe_unit_count(int *result) {
 
   if (*result < 0) {
     lderr(cct) << "failed to read striping metadata: " << cpp_strerror(*result)
+               << dendl;
+    send_close_image(*result);
+    return nullptr;
+  }
+
+  send_v2_get_create_timestamp();
+  return nullptr;
+}
+
+template <typename I>
+void OpenRequest<I>::send_v2_get_create_timestamp() {
+  CephContext *cct = m_image_ctx->cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  librados::ObjectReadOperation op;
+  cls_client::get_create_timestamp_start(&op);
+
+  using klass = OpenRequest<I>;
+  librados::AioCompletion *comp = create_rados_callback<
+    klass, &klass::handle_v2_get_create_timestamp>(this);
+  m_out_bl.clear();
+  m_image_ctx->md_ctx.aio_operate(m_image_ctx->header_oid, comp, &op,
+                                  &m_out_bl);
+  comp->release();
+}
+
+template <typename I>
+Context *OpenRequest<I>::handle_v2_get_create_timestamp(int *result) {
+  CephContext *cct = m_image_ctx->cct;
+  ldout(cct, 10) << this << " " << __func__ << ": r=" << *result << dendl;
+
+  if (*result == 0) {
+    bufferlist::iterator it = m_out_bl.begin();
+    *result = cls_client::get_create_timestamp_finish(&it,
+        &m_image_ctx->create_timestamp);
+  }
+  if (*result < 0 && *result != -EOPNOTSUPP) {
+    lderr(cct) << "failed to retrieve create_timestamp: "
+               << cpp_strerror(*result)
                << dendl;
     send_close_image(*result);
     return nullptr;
@@ -427,7 +466,7 @@ Context *OpenRequest<I>::handle_v2_apply_metadata(int *result) {
     }
   }
 
-  m_image_ctx->apply_metadata(m_metadata);
+  m_image_ctx->apply_metadata(m_metadata, true);
 
   send_register_watch();
   return nullptr;

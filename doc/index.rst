@@ -19,7 +19,7 @@ system**.
 - Striped objects
 - Cloud solution integration
 - Multi-site deployment
-- Disaster recovery
+- Multi-site replication
 
 .. raw:: html 
 
@@ -36,7 +36,7 @@ system**.
 - KVM/libvirt support
 - Back-end for cloud solutions
 - Incremental backup
-- Disaster recovery
+- Disaster recovery (multisite asynchronous replication)
 
 .. raw:: html 
 
@@ -46,7 +46,7 @@ system**.
 - Separates metadata from data
 - Dynamic rebalancing
 - Subdirectory snapshots
-- Configurable striping 
+- Configurable striping
 - Kernel driver support
 - FUSE support
 - NFS/CIFS deployable
@@ -82,7 +82,7 @@ about Ceph, see our `Architecture`_ section.
 
 
 .. _Ceph Object Store: radosgw
-.. _Ceph Block Device: rbd/rbd
+.. _Ceph Block Device: rbd
 .. _Ceph Filesystem: cephfs
 .. _Getting Started: start
 .. _Architecture: architecture
@@ -96,12 +96,13 @@ about Ceph, see our `Architecture`_ section.
    install/index
    rados/index
    cephfs/index
-   rbd/rbd
+   rbd/index
    radosgw/index
    mgr/index
    api/index
    architecture
    Development <dev/index>
+   ceph-volume/index
    release-notes
    releases
    Glossary <glossary>

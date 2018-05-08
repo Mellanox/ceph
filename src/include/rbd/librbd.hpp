@@ -71,19 +71,6 @@ namespace librbd {
     bool up;
   } mirror_image_status_t;
 
-  typedef rbd_group_image_state_t group_image_state_t;
-
-  typedef struct {
-    std::string name;
-    int64_t pool;
-    group_image_state_t state;
-  } group_image_status_t;
-
-  typedef struct {
-    std::string name;
-    int64_t pool;
-  } group_spec_t;
-
   typedef rbd_image_info_t image_info_t;
 
   class CEPH_RBD_API ProgressContext
@@ -185,20 +172,6 @@ public:
   int mirror_image_status_summary(IoCtx& io_ctx,
       std::map<mirror_image_status_state_t, int> *states);
 
-  // RBD consistency groups support functions
-  int group_create(IoCtx& io_ctx, const char *group_name);
-  int group_remove(IoCtx& io_ctx, const char *group_name);
-  int group_list(IoCtx& io_ctx, std::vector<std::string> *names);
-
-  int group_image_add(IoCtx& io_ctx, const char *group_name,
-		      IoCtx& image_io_ctx, const char *image_name);
-  int group_image_remove(IoCtx& io_ctx, const char *group_name,
-			 IoCtx& image_io_ctx, const char *image_name);
-  int group_image_remove_by_id(IoCtx& io_ctx, const char *group_name,
-                               IoCtx& image_io_ctx, const char *image_id);
-  int group_image_list(IoCtx& io_ctx, const char *group_name,
-		       std::vector<group_image_status_t> *images);
-
 private:
   /* We don't allow assignment or copying */
   RBD(const RBD& rhs);
@@ -259,7 +232,6 @@ public:
                    std::string *parent_id, std::string *parent_snapname);
   int old_format(uint8_t *old);
   int size(uint64_t *size);
-  int get_group(group_spec_t *group_spec);
   int features(uint64_t *features);
   int update_features(uint64_t features, bool enabled);
   int overlap(uint64_t *overlap);
@@ -296,6 +268,8 @@ public:
   /* striping */
   uint64_t get_stripe_unit() const;
   uint64_t get_stripe_count() const;
+
+  int get_create_timestamp(struct timespec *timestamp);
 
   int flatten();
   int flatten_with_progress(ProgressContext &prog_ctx);
@@ -374,6 +348,8 @@ public:
   ssize_t write2(uint64_t ofs, size_t len, ceph::bufferlist& bl, int op_flags);
   int discard(uint64_t ofs, uint64_t len);
   ssize_t writesame(uint64_t ofs, size_t len, ceph::bufferlist &bl, int op_flags);
+  ssize_t compare_and_write(uint64_t ofs, size_t len, ceph::bufferlist &cmp_bl,
+                            ceph::bufferlist& bl, uint64_t *mismatch_off, int op_flags);
 
   int aio_write(uint64_t off, size_t len, ceph::bufferlist& bl, RBD::AioCompletion *c);
   /* @param op_flags see librados.h constants beginning with LIBRADOS_OP_FLAG */
@@ -381,6 +357,9 @@ public:
 		  RBD::AioCompletion *c, int op_flags);
   int aio_writesame(uint64_t off, size_t len, ceph::bufferlist& bl,
                     RBD::AioCompletion *c, int op_flags);
+  int aio_compare_and_write(uint64_t off, size_t len, ceph::bufferlist& cmp_bl,
+                            ceph::bufferlist& bl, RBD::AioCompletion *c,
+                            uint64_t *mismatch_off, int op_flags);
   /**
    * read async from image
    *

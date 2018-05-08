@@ -204,6 +204,37 @@ TRACEPOINT_EVENT(librbd, writesame_exit,
     )
 )
 
+TRACEPOINT_EVENT(librbd, compare_and_write_enter,
+    TP_ARGS(
+        void*, imagectx,
+        const char*, name,
+        const char*, snap_name,
+        char, read_only,
+        uint64_t, off,
+        size_t, len,
+        const char*, cmp_buf,
+        const char*, buf,
+	int, op_flags),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagectx, imagectx)
+        ctf_string(name, name)
+        ctf_string(snap_name, snap_name)
+        ctf_integer(char, read_only, read_only)
+        ctf_integer(uint64_t, off, off)
+        ceph_ctf_sequence(unsigned char, cmp_buf, cmp_buf, size_t, len)
+        ceph_ctf_sequence(unsigned char, buf, buf, size_t, len)
+        ctf_integer(int, op_flags, op_flags)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, compare_and_write_exit,
+    TP_ARGS(
+        ssize_t, retval),
+    TP_FIELDS(
+        ctf_integer(ssize_t, retval, retval)
+    )
+)
+
 TRACEPOINT_EVENT(librbd, open_image_by_id_enter,
     TP_ARGS(
         void*, imagectx,
@@ -1159,6 +1190,40 @@ TRACEPOINT_EVENT(librbd, aio_writesame_exit,
     )
 )
 
+TRACEPOINT_EVENT(librbd, aio_compare_and_write_enter,
+    TP_ARGS(
+        void*, imagectx,
+        const char*, name,
+        const char*, snap_name,
+        char, read_only,
+        uint64_t, off,
+        size_t, len,
+        const char*, cmp_buf,
+        const char*, buf,
+        const void*, completion,
+	      int, op_flags),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagectx, imagectx)
+        ctf_string(name, name)
+        ctf_string(snap_name, snap_name)
+        ctf_integer(char, read_only, read_only)
+        ctf_integer(uint64_t, off, off)
+        ctf_integer(size_t, len, len)
+        ceph_ctf_sequence(unsigned char, cmp_buf, cmp_buf, size_t, len)
+        ceph_ctf_sequence(unsigned char, buf, buf, size_t, len)
+        ctf_integer_hex(const void*, completion, completion)
+        ctf_integer(int, op_flags, op_flags)
+    )
+)
+TRACEPOINT_EVENT(librbd, aio_compare_and_write_exit,
+    TP_ARGS(
+        int, retval),
+    TP_FIELDS(
+        ctf_integer(int, retval, retval)
+    )
+)
+
+
 TRACEPOINT_EVENT(librbd, clone_enter,
     TP_ARGS(
         const char*, parent_pool_name,
@@ -1934,6 +1999,28 @@ TRACEPOINT_EVENT(librbd, get_stripe_count_exit,
     )
 )
 
+TRACEPOINT_EVENT(librbd, get_create_timestamp_enter,
+    TP_ARGS(
+        void*, imagectx,
+        const char*, name,
+        char, read_only),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagectx, imagectx)
+        ctf_string(name, name)
+        ctf_integer(char, read_only, read_only)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, get_create_timestamp_exit,
+    TP_ARGS(
+        int, retval,
+        struct timespec*, timestamp),
+    TP_FIELDS(
+        ctf_integer(int, retval, retval)
+        ctf_integer(uint64_t, timestamp, timestamp->tv_sec)
+    )
+)
+
 TRACEPOINT_EVENT(librbd, get_features_enter,
     TP_ARGS(
         void*, imagectx,
@@ -2196,72 +2283,6 @@ TRACEPOINT_EVENT(librbd, stat_exit,
     )
 )
 
-TRACEPOINT_EVENT(librbd, group_create_enter,
-    TP_ARGS(
-        const char*, pool_name,
-        int64_t, id,
-        const char*, groupname),
-    TP_FIELDS(
-        ctf_string(pool_name, pool_name)
-        ctf_integer(int64_t, id, id)
-        ctf_string(groupname, groupname)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_create_exit,
-    TP_ARGS(
-        int, retval),
-    TP_FIELDS(
-        ctf_integer(int, retval, retval)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_remove_enter,
-    TP_ARGS(
-        const char*, pool_name,
-        int64_t, id,
-        const char*, groupname),
-    TP_FIELDS(
-        ctf_string(pool_name, pool_name)
-        ctf_integer(int64_t, id, id)
-        ctf_string(groupname, groupname)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_remove_exit,
-    TP_ARGS(
-        int, retval),
-    TP_FIELDS(
-        ctf_integer(int, retval, retval)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_list_enter,
-    TP_ARGS(
-        const char*, pool_name,
-        int64_t, id),
-    TP_FIELDS(
-        ctf_string(pool_name, pool_name)
-        ctf_integer(int64_t, id, id)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_list_entry,
-    TP_ARGS(
-        const char*, name),
-    TP_FIELDS(
-        ctf_string(name, name)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_list_exit,
-    TP_ARGS(
-        int, retval),
-    TP_FIELDS(
-        ctf_integer(int, retval, retval)
-    )
-)
-
 TRACEPOINT_EVENT(librbd, update_watch_enter,
     TP_ARGS(
         void*, imagectx,
@@ -2295,120 +2316,6 @@ TRACEPOINT_EVENT(librbd, update_unwatch_enter,
 TRACEPOINT_EVENT(librbd, update_unwatch_exit,
     TP_ARGS(
         int, retval),
-    TP_FIELDS(
-        ctf_integer(int, retval, retval)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_image_add_enter,
-    TP_ARGS(
-        const char*, pool_name,
-        int64_t, id,
-        const char*, group_name,
-        const char*, image_pool_name,
-        int64_t, image_id,
-        const char*, image_name),
-    TP_FIELDS(
-        ctf_string(pool_name, pool_name)
-        ctf_integer(int64_t, id, id)
-        ctf_string(group_name, group_name)
-        ctf_string(image_pool_name, image_pool_name)
-        ctf_integer(int64_t, image_id, image_id)
-        ctf_string(image_name, image_name)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_image_add_exit,
-    TP_ARGS(
-        int, retval),
-    TP_FIELDS(
-        ctf_integer(int, retval, retval)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_image_remove_enter,
-    TP_ARGS(
-        const char*, pool_name,
-        int64_t, id,
-        const char*, group_name,
-        const char*, image_pool_name,
-        int64_t, image_id,
-        const char*, image_name),
-    TP_FIELDS(
-        ctf_string(pool_name, pool_name)
-        ctf_integer(int64_t, id, id)
-        ctf_string(group_name, group_name)
-        ctf_string(image_pool_name, image_pool_name)
-        ctf_integer(int64_t, image_id, image_id)
-        ctf_string(image_name, image_name)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_image_remove_exit,
-    TP_ARGS(
-        int, retval),
-    TP_FIELDS(
-        ctf_integer(int, retval, retval)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_image_remove_by_id_enter,
-    TP_ARGS(
-        const char*, pool_name,
-        int64_t, id,
-        const char*, group_name,
-        const char*, image_pool_name,
-        int64_t, image_ioctx_id,
-        const char*, image_id),
-    TP_FIELDS(
-        ctf_string(pool_name, pool_name)
-        ctf_integer(int64_t, id, id)
-        ctf_string(group_name, group_name)
-        ctf_string(image_pool_name, image_pool_name)
-        ctf_integer(int64_t, image_ioctx_id, image_ioctx_id)
-        ctf_string(image_id, image_id)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_image_remove_by_id_exit,
-    TP_ARGS(
-        int, retval),
-    TP_FIELDS(
-        ctf_integer(int, retval, retval)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_image_list_enter,
-    TP_ARGS(
-        const char*, pool_name,
-        int64_t, id,
-        const char*, group_name),
-    TP_FIELDS(
-        ctf_string(pool_name, pool_name)
-        ctf_integer(int64_t, id, id)
-        ctf_string(group_name, group_name)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, group_image_list_exit,
-    TP_ARGS(
-	    int, retval),
-    TP_FIELDS(
-        ctf_integer(int, retval, retval)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, image_get_group_enter,
-    TP_ARGS(
-        const char*, image_name),
-    TP_FIELDS(
-        ctf_string(image_name, image_name)
-    )
-)
-
-TRACEPOINT_EVENT(librbd, image_get_group_exit,
-    TP_ARGS(
-	    int, retval),
     TP_FIELDS(
         ctf_integer(int, retval, retval)
     )

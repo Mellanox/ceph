@@ -58,9 +58,10 @@ BitmapFreelistManager::BitmapFreelistManager(CephContext* cct,
 {
 }
 
-int BitmapFreelistManager::create(uint64_t new_size, KeyValueDB::Transaction txn)
+int BitmapFreelistManager::create(uint64_t new_size, uint64_t granularity,
+				  KeyValueDB::Transaction txn)
 {
-  bytes_per_block = cct->_conf->bdev_block_size;
+  bytes_per_block = granularity;
   assert(ISP2(bytes_per_block));
   size = P2ALIGN(new_size, bytes_per_block);
   blocks_per_key = cct->_conf->bluestore_freelist_blocks_per_key;
@@ -105,7 +106,7 @@ int BitmapFreelistManager::create(uint64_t new_size, KeyValueDB::Transaction txn
   return 0;
 }
 
-int BitmapFreelistManager::init()
+int BitmapFreelistManager::init(uint64_t dev_size)
 {
   dout(1) << __func__ << dendl;
 
@@ -153,6 +154,49 @@ int BitmapFreelistManager::init()
 	   << " blocks_per_key 0x" << blocks_per_key
 	   << std::dec << dendl;
   _init_misc();
+
+  // check for http://tracker.ceph.com/issues/21089 inconsistency
+  {
+    uint64_t new_size = P2ALIGN(dev_size, bytes_per_block);
+    if (new_size != size) {
+      uint64_t bad_size = new_size & ~bytes_per_block;
+      if (size == bad_size) {
+	derr << __func__ << " size is 0x" << std::hex << size << " should be 0x"
+	     << new_size << " and appears to be due to #21089" << std::dec
+	     << dendl;
+
+	uint64_t new_blocks = new_size / bytes_per_block;
+	if (new_blocks / blocks_per_key * blocks_per_key != new_blocks) {
+	  new_blocks = (new_blocks / blocks_per_key + 1) *
+	    blocks_per_key;
+	}
+
+	KeyValueDB::Transaction t = kvdb->get_transaction();
+	{
+	  bufferlist sizebl;
+	  ::encode(new_size, sizebl);
+	  t->set(meta_prefix, "size", sizebl);
+	}
+	if (new_blocks != blocks) {
+	  derr << "blocks is 0x" << std::hex << blocks << " should be 0x"
+	       << new_blocks << std::dec << dendl;
+	  bufferlist bl;
+	  ::encode(new_blocks, bl);
+	  t->set(meta_prefix, "blocks", bl);
+	  _xor(new_size, new_blocks * bytes_per_block - new_size, t);
+	} else {
+	  derr << "blocks are ok" << dendl;
+	  _xor(bad_size, bytes_per_block, t);
+	}
+	int r = kvdb->submit_transaction_sync(t);
+	assert(r == 0);
+	size = new_size;
+	blocks = new_blocks;
+	derr << __func__ << " fixed inconsistency, size now 0x" << std::hex
+	     << size << " blocks 0x" << blocks << std::dec << dendl;
+      }
+    }
+  }
   return 0;
 }
 
@@ -183,6 +227,7 @@ void BitmapFreelistManager::enumerate_reset()
   enumerate_offset = 0;
   enumerate_bl_pos = 0;
   enumerate_bl.clear();
+  enumerate_p.reset();
 }
 
 int get_next_clear_bit(bufferlist& bl, int start)
@@ -190,10 +235,10 @@ int get_next_clear_bit(bufferlist& bl, int start)
   const char *p = bl.c_str();
   int bits = bl.length() << 3;
   while (start < bits) {
-    int which_byte = start / 8;
-    int which_bit = start % 8;
-    unsigned char byte_mask = 1 << which_bit;
-    if ((p[which_byte] & byte_mask) == 0) {
+    // byte = start / 8 (or start >> 3)
+    // bit = start % 8 (or start & 7)
+    unsigned char byte_mask = 1 << (start & 7);
+    if ((p[start >> 3] & byte_mask) == 0) {
       return start;
     }
     ++start;
@@ -288,8 +333,8 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
 		 << enumerate_offset << " bit 0x" << enumerate_bl_pos
 		 << " offset 0x" << end << std::dec
 		 << dendl;
+	end = std::min(get_alloc_units() * bytes_per_block, end);
 	*length = end - *offset;
-        assert((*offset  + *length) <= size);
         dout(10) << __func__ << std::hex << " 0x" << *offset << "~" << *length
 		 << std::dec << dendl;
 	return true;
@@ -309,14 +354,13 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
     }
   }
 
-  end = size;
-  if (enumerate_offset < end) {
+  if (enumerate_offset < size) {
+    end = get_alloc_units() * bytes_per_block;
     *length = end - *offset;
     dout(10) << __func__ << std::hex << " 0x" << *offset << "~" << *length
 	     << std::dec << dendl;
-    enumerate_offset = end;
+    enumerate_offset = size;
     enumerate_bl_pos = blocks_per_key;
-    assert((*offset  + *length) <= size);
     return true;
   }
 

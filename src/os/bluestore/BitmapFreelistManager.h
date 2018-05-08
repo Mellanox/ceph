@@ -51,9 +51,10 @@ public:
 
   static void setup_merge_operator(KeyValueDB *db, string prefix);
 
-  int create(uint64_t size, KeyValueDB::Transaction txn) override;
+  int create(uint64_t size, uint64_t granularity,
+	     KeyValueDB::Transaction txn) override;
 
-  int init() override;
+  int init(uint64_t dev_size) override;
   void shutdown() override;
 
   void dump() override;
@@ -67,6 +68,14 @@ public:
   void release(
     uint64_t offset, uint64_t length,
     KeyValueDB::Transaction txn) override;
+
+  inline uint64_t get_alloc_units() const override {
+    return size / bytes_per_block;
+  }
+  inline uint64_t get_alloc_size() const override {
+    return bytes_per_block;
+  }
+
 };
 
 #endif

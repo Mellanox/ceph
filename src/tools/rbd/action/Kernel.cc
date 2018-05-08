@@ -259,8 +259,10 @@ static void print_error_description(const char *poolname, const char *imgname,
       } else {
         std::cout << "You can disable features unsupported by the kernel "
                   << "with \"rbd feature disable ";
-        if (poolname != at::DEFAULT_POOL_NAME)
+
+        if (poolname != utils::get_default_pool_name()) {
           std::cout << poolname << "/";
+        }
         std::cout << imgname;
       }
     } else {
@@ -301,7 +303,7 @@ static int do_kernel_map(const char *poolname, const char *imgname,
     // default and omit it even if it was specified by the user
     // (see ceph.git commit fb0f1986449b)
     if (it->first == "rw" && it->second == "rw") {
-      map_options.erase(it);
+      it = map_options.erase(it);
     } else {
       if (it != map_options.begin())
         oss << ",";
@@ -412,7 +414,8 @@ int execute_map(const po::variables_map &vm) {
   }
 
   // parse default options first so they can be overwritten by cli options
-  char *default_map_options = strdup(g_conf->rbd_default_map_options.c_str());
+  char *default_map_options = strdup(g_conf->get_val<std::string>(
+    "rbd_default_map_options").c_str());
   BOOST_SCOPE_EXIT( (default_map_options) ) {
     free(default_map_options);
   } BOOST_SCOPE_EXIT_END;

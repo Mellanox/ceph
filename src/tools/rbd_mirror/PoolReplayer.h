@@ -15,6 +15,7 @@
 #include "PoolWatcher.h"
 #include "ImageDeleter.h"
 #include "types.h"
+#include "tools/rbd_mirror/service_daemon/Types.h"
 
 #include <set>
 #include <map>
@@ -29,9 +30,10 @@ namespace librbd { class ImageCtx; }
 namespace rbd {
 namespace mirror {
 
-template <typename> struct Threads;
 template <typename> class InstanceReplayer;
 template <typename> class InstanceWatcher;
+template <typename> class ServiceDaemon;
+template <typename> struct Threads;
 
 /**
  * Controls mirroring for a single remote cluster.
@@ -39,8 +41,8 @@ template <typename> class InstanceWatcher;
 class PoolReplayer {
 public:
   PoolReplayer(Threads<librbd::ImageCtx> *threads,
-	       std::shared_ptr<ImageDeleter> image_deleter,
-	       ImageSyncThrottlerRef<> image_sync_throttler,
+               ServiceDaemon<librbd::ImageCtx>* service_daemon,
+	       ImageDeleter<>* image_deleter,
 	       int64_t local_pool_id, const peer_t &peer,
 	       const std::vector<const char*> &args);
   ~PoolReplayer();
@@ -49,8 +51,11 @@ public:
 
   bool is_blacklisted() const;
   bool is_leader() const;
+  bool is_running() const;
 
-  int init();
+  void init();
+  void shut_down();
+
   void run();
 
   void print_status(Formatter *f, stringstream *ss);
@@ -84,7 +89,8 @@ private:
 
   int init_rados(const std::string &cluster_name,
                  const std::string &client_name,
-                 const std::string &description, RadosRef *rados_ref);
+                 const std::string &description, RadosRef *rados_ref,
+                 bool strip_cluster_overrides);
 
   void handle_post_acquire_leader(Context *on_finish);
   void handle_pre_release_leader(Context *on_finish);
@@ -100,24 +106,26 @@ private:
   void wait_for_update_ops(Context *on_finish);
   void handle_wait_for_update_ops(int r, Context *on_finish);
 
+  void handle_update_leader(const std::string &leader_instance_id);
+
   Threads<librbd::ImageCtx> *m_threads;
-  std::shared_ptr<ImageDeleter> m_image_deleter;
-  ImageSyncThrottlerRef<> m_image_sync_throttler;
+  ServiceDaemon<librbd::ImageCtx>* m_service_daemon;
+  ImageDeleter<>* m_image_deleter;
+  int64_t m_local_pool_id = -1;
+  peer_t m_peer;
+  std::vector<const char*> m_args;
+
   mutable Mutex m_lock;
   Cond m_cond;
   std::atomic<bool> m_stopping = { false };
   bool m_manual_stop = false;
   bool m_blacklisted = false;
 
-  peer_t m_peer;
-  std::vector<const char*> m_args;
   RadosRef m_local_rados;
   RadosRef m_remote_rados;
 
   librados::IoCtx m_local_io_ctx;
   librados::IoCtx m_remote_io_ctx;
-
-  int64_t m_local_pool_id = -1;
 
   PoolWatcherListener m_local_pool_watcher_listener;
   std::unique_ptr<PoolWatcher<> > m_local_pool_watcher;
@@ -128,9 +136,9 @@ private:
   std::unique_ptr<InstanceReplayer<librbd::ImageCtx>> m_instance_replayer;
 
   std::string m_asok_hook_name;
-  AdminSocketHook *m_asok_hook;
+  AdminSocketHook *m_asok_hook = nullptr;
 
-  std::map<std::string, ImageIds> m_initial_mirror_image_ids;
+  service_daemon::CalloutId m_callout_id = service_daemon::CALLOUT_ID_NONE;
 
   class PoolReplayerThread : public Thread {
     PoolReplayer *m_pool_replayer;
@@ -157,6 +165,11 @@ private:
 
     void pre_release_handler(Context *on_finish) override {
       m_pool_replayer->handle_pre_release_leader(on_finish);
+    }
+
+    void update_leader_handler(
+      const std::string &leader_instance_id) override {
+      m_pool_replayer->handle_update_leader(leader_instance_id);
     }
 
   private:

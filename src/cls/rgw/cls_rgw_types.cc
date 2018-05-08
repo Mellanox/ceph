@@ -1,6 +1,5 @@
 
 #include "cls/rgw/cls_rgw_types.h"
-#include "common/Formatter.h"
 #include "common/ceph_json.h"
 #include "include/utime.h"
 
@@ -367,6 +366,10 @@ void rgw_bi_log_entry::decode_json(JSONObj *obj)
     op = CLS_RGW_OP_LINK_OLH_DM;
   } else if (op_str == "unlink_instance") {
     op = CLS_RGW_OP_UNLINK_INSTANCE;
+  } else if (op_str == "syncstop") {
+    op = CLS_RGW_OP_SYNCSTOP;
+  } else if (op_str == "resync") {
+    op = CLS_RGW_OP_RESYNC;
   } else {
     op = CLS_RGW_OP_UNKNOWN;
   }
@@ -391,6 +394,7 @@ void rgw_bi_log_entry::decode_json(JSONObj *obj)
   bilog_flags = (uint16_t)f;
   JSONDecoder::decode_json("owner", owner, obj);
   JSONDecoder::decode_json("owner_display_name", owner_display_name, obj);
+  JSONDecoder::decode_json("zones_trace", zones_trace, obj);
 }
 
 void rgw_bi_log_entry::dump(Formatter *f) const
@@ -418,6 +422,12 @@ void rgw_bi_log_entry::dump(Formatter *f) const
       break;
     case CLS_RGW_OP_UNLINK_INSTANCE:
       f->dump_string("op", "unlink_instance");
+      break;
+    case CLS_RGW_OP_SYNCSTOP:
+      f->dump_string("op", "syncstop");
+      break;
+    case CLS_RGW_OP_RESYNC:
+      f->dump_string("op", "resync");
       break;
     default:
       f->dump_string("op", "invalid");
@@ -449,6 +459,7 @@ void rgw_bi_log_entry::dump(Formatter *f) const
   f->dump_bool("versioned", (bilog_flags & RGW_BILOG_FLAG_VERSIONED_OP) != 0);
   f->dump_string("owner", owner);
   f->dump_string("owner_display_name", owner_display_name);
+  encode_json("zones_trace", zones_trace, f);
 }
 
 void rgw_bi_log_entry::generate_test_instances(list<rgw_bi_log_entry*>& ls)
@@ -515,6 +526,7 @@ void rgw_bucket_dir_header::dump(Formatter *f) const
     iter->second.dump(f);
     f->close_section();
   }
+  ::encode_json("new_instance", new_instance, f);
   f->close_section();
 }
 
@@ -563,3 +575,54 @@ void rgw_bucket_dir::dump(Formatter *f) const
   f->close_section();
 }
 
+void cls_rgw_reshard_entry::generate_key(const string& tenant, const string& bucket_name, string *key)
+{
+  *key = tenant + ":" + bucket_name;
+}
+
+void cls_rgw_reshard_entry::get_key(string *key) const
+{
+  generate_key(tenant, bucket_name, key);
+}
+
+void cls_rgw_reshard_entry::dump(Formatter *f) const
+{
+  utime_t ut(time);
+  encode_json("time",ut, f);
+  encode_json("tenant", tenant, f);
+  encode_json("bucket_name", bucket_name, f);
+  encode_json("bucket_id", bucket_id, f);
+  encode_json("new_instance_id", new_instance_id, f);
+  encode_json("old_num_shards", old_num_shards, f);
+  encode_json("new_num_shards", new_num_shards, f);
+
+}
+
+void cls_rgw_reshard_entry::generate_test_instances(list<cls_rgw_reshard_entry*>& ls)
+{
+  ls.push_back(new cls_rgw_reshard_entry);
+  ls.push_back(new cls_rgw_reshard_entry);
+  ls.back()->time = ceph::real_clock::from_ceph_timespec({2, 3});
+  ls.back()->tenant = "tenant";
+  ls.back()->bucket_name = "bucket1""";
+  ls.back()->bucket_id = "bucket_id";
+  ls.back()->new_instance_id = "new_instance_id";
+  ls.back()->old_num_shards = 8;
+  ls.back()->new_num_shards = 64;
+}
+
+void cls_rgw_bucket_instance_entry::dump(Formatter *f) const
+{
+  encode_json("reshard_status", (int)reshard_status, f);
+  encode_json("new_bucket_instance_id", new_bucket_instance_id, f);
+  encode_json("num_shards", num_shards, f);
+
+}
+
+void cls_rgw_bucket_instance_entry::generate_test_instances(list<cls_rgw_bucket_instance_entry*>& ls)
+{
+  ls.push_back(new cls_rgw_bucket_instance_entry);
+  ls.push_back(new cls_rgw_bucket_instance_entry);
+  ls.back()->reshard_status = CLS_RGW_RESHARD_IN_PROGRESS;
+  ls.back()->new_bucket_instance_id = "new_instance_id";
+}

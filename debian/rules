@@ -22,6 +22,13 @@ ifeq ($(DEB_HOST_ARCH), armel)
   extraopts += -DWITH_ATOMIC_OPS=OFF
 endif
 
+ifneq (,$(filter $(DEB_HOST_ARCH), arm armel armhf arm64 i386 amd64 mips mipsel powerpc ppc64))
+  # libboost_context only support the archs above
+  extraopts += -DWITH_BOOST_CONTEXT=ON
+else
+  extraopts += -DWITH_BOOST_CONTEXT=OFF
+endif
+
 %:
 	dh $@ --buildsystem=cmake --with javahelper,python2,python3,systemd --parallel
 
@@ -43,6 +50,7 @@ override_dh_auto_install:
 	install -D -m 644 udev/95-ceph-osd.rules $(DESTDIR)/lib/udev/rules.d/95-ceph-osd.rules
 	install -D -m 644 udev/60-ceph-by-parttypeuuid.rules $(DESTDIR)/lib/udev/rules.d/60-ceph-by-parttypeuuid.rules
 	install -D -m 644 src/etc-rbdmap $(DESTDIR)/etc/ceph/rbdmap
+	install -D -m 644 etc/sysctl/90-ceph-osd.conf $(DESTDIR)/etc/sysctl.d/30-ceph-osd.conf
 
 # doc/changelog is a directory, which confuses dh_installchangelogs
 override_dh_installchangelogs:
@@ -52,8 +60,8 @@ override_dh_installdocs:
 	dh_installdocs -a --all ChangeLog
 
 override_dh_installlogrotate:
-	cp src/logrotate.conf debian/ceph-base.ceph.logrotate
-	dh_installlogrotate -pceph-base --name=ceph
+	cp src/logrotate.conf debian/ceph-common.logrotate
+	dh_installlogrotate -pceph-common
 
 override_dh_installinit:
 	# dh_installinit is only set up to handle one upstart script
@@ -89,10 +97,12 @@ override_dh_installinit:
 	install -m0644 systemd/ceph-mon@.service debian/ceph-mon/lib/systemd/system
 	install -m0644 systemd/ceph-osd@.service debian/ceph-osd/lib/systemd/system
 	install -m0644 systemd/ceph-disk@.service debian/ceph-osd/lib/systemd/system
+	install -m0644 systemd/ceph-volume@.service debian/ceph-osd/lib/systemd/system
 	install -m0644 systemd/rbdmap.service debian/ceph-common/lib/systemd/system
 	sed -i s./etc/sysconfig/./etc/default/.g debian/ceph-mon/lib/systemd/system/ceph-mon@.service
 	sed -i s./etc/sysconfig/./etc/default/.g debian/ceph-osd/lib/systemd/system/ceph-osd@.service
 	sed -i s./etc/sysconfig/./etc/default/.g debian/ceph-osd/lib/systemd/system/ceph-disk@.service
+	sed -i s./etc/sysconfig/./etc/default/.g debian/ceph-osd/lib/systemd/system/ceph-volume@.service
 	install -m0644 systemd/ceph-mon.target debian/ceph-mon/lib/systemd/system
 	install -m0644 systemd/ceph-osd.target debian/ceph-osd/lib/systemd/system
 
@@ -124,8 +134,15 @@ override_dh_installinit:
 	dh_installinit -p ceph-base --name ceph --no-start
 	dh_installinit -p radosgw --no-start
 
-override_dh_systemd_start:
+	# NOTE: execute systemd helpers so they pickup dh_install'ed units and targets
+	dh_systemd_enable
 	dh_systemd_start --no-restart-on-upgrade
+
+override_dh_systemd_enable:
+	# systemd enable done as part of dh_installinit
+
+override_dh_systemd_start:
+	# systemd start done as part of dh_installinit
 
 override_dh_strip:
 	dh_strip -pceph-mds --dbg-package=ceph-mds-dbg
@@ -133,6 +150,7 @@ override_dh_strip:
 	dh_strip -pceph-mgr --dbg-package=ceph-mgr-dbg
 	dh_strip -pceph-mon --dbg-package=ceph-mon-dbg
 	dh_strip -pceph-osd --dbg-package=ceph-osd-dbg
+	dh_strip -pceph-base --dbg-package=ceph-base-dbg
 	dh_strip -pceph-fuse --dbg-package=ceph-fuse-dbg
 	dh_strip -prbd-fuse --dbg-package=rbd-fuse-dbg
 	dh_strip -prbd-mirror --dbg-package=rbd-mirror-dbg
@@ -145,6 +163,14 @@ override_dh_strip:
 	dh_strip -plibrgw2 --dbg-package=librgw2-dbg
 	dh_strip -pradosgw --dbg-package=radosgw-dbg
 	dh_strip -pceph-test --dbg-package=ceph-test-dbg
+	dh_strip -ppython-rados --dbg-package=python-rados-dbg
+	dh_strip -ppython3-rados --dbg-package=python3-rados-dbg
+	dh_strip -ppython-rbd --dbg-package=python-rbd-dbg
+	dh_strip -ppython3-rbd --dbg-package=python3-rbd-dbg
+	dh_strip -ppython-rgw --dbg-package=python-rgw-dbg
+	dh_strip -ppython3-rgw --dbg-package=python3-rgw-dbg
+	dh_strip -ppython-cephfs --dbg-package=python-cephfs-dbg
+	dh_strip -ppython3-cephfs --dbg-package=python3-cephfs-dbg
 
 override_dh_shlibdeps:
 	dh_shlibdeps -a --exclude=erasure-code --exclude=rados-classes --exclude=compressor

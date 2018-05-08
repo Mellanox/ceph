@@ -25,7 +25,6 @@ using namespace std;
 #include "include/unordered_set.h"
 
 #include "common/Mutex.h"
-#include "include/atomic.h"
 #include "include/Spinlock.h"
 #include "common/Cond.h"
 #include "common/Thread.h"
@@ -94,6 +93,7 @@ public:
    * @{
    */
   void set_addr_unknowns(const entity_addr_t& addr) override;
+  void set_addr(const entity_addr_t &addr) override;
 
   int get_dispatch_queue_len() override {
     return dispatch_queue.get_queue_len();
@@ -322,7 +322,7 @@ private:
     if (p == rank_pipe.end())
       return NULL;
     // see lock cribbing in Pipe::fault()
-    if (p->second->state_closed.read())
+    if (p->second->state_closed)
       return NULL;
     return p->second;
   }

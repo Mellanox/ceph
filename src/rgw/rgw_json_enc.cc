@@ -11,6 +11,7 @@
 #include "rgw_keystone.h"
 #include "rgw_basic_types.h"
 #include "rgw_op.h"
+#include "rgw_data_sync.h"
 #include "rgw_sync.h"
 #include "rgw_orphan.h"
 
@@ -199,6 +200,13 @@ void ACLOwner::dump(Formatter *f) const
 {
   encode_json("id", id.to_str(), f);
   encode_json("display_name", display_name, f);
+}
+
+void ACLOwner::decode_json(JSONObj *obj) {
+  string id_str;
+  JSONDecoder::decode_json("id", id_str, obj);
+  id.from_str(id_str);
+  JSONDecoder::decode_json("display_name", display_name, obj);
 }
 
 void RGWAccessControlPolicy::dump(Formatter *f) const
@@ -698,12 +706,17 @@ void RGWBWRoutingRules::decode_json(JSONObj *obj) {
 
 void RGWBucketWebsiteConf::dump(Formatter *f) const
 {
-  encode_json("index_doc_suffix", index_doc_suffix, f);
-  encode_json("error_doc", error_doc, f);
-  encode_json("routing_rules", routing_rules, f);
+  if (!redirect_all.hostname.empty()) {
+    encode_json("redirect_all", redirect_all, f);
+  } else {
+    encode_json("index_doc_suffix", index_doc_suffix, f);
+    encode_json("error_doc", error_doc, f);
+    encode_json("routing_rules", routing_rules, f);
+  }
 }
 
 void RGWBucketWebsiteConf::decode_json(JSONObj *obj) {
+  JSONDecoder::decode_json("redirect_all", redirect_all, obj);
   JSONDecoder::decode_json("index_doc_suffix", index_doc_suffix, obj);
   JSONDecoder::decode_json("error_doc", error_doc, obj);
   JSONDecoder::decode_json("routing_rules", routing_rules, obj);
@@ -730,6 +743,9 @@ void RGWBucketInfo::dump(Formatter *f) const
   encode_json("swift_versioning", swift_versioning, f);
   encode_json("swift_ver_location", swift_ver_location, f);
   encode_json("index_type", (uint32_t)index_type, f);
+  encode_json("mdsearch_config", mdsearch_config, f);
+  encode_json("reshard_status", (int)reshard_status, f);
+  encode_json("new_bucket_instance_id", new_bucket_instance_id, f);
 }
 
 void RGWBucketInfo::decode_json(JSONObj *obj) {
@@ -761,6 +777,11 @@ void RGWBucketInfo::decode_json(JSONObj *obj) {
   uint32_t it;
   JSONDecoder::decode_json("index_type", it, obj);
   index_type = (RGWBucketIndexType)it;
+  JSONDecoder::decode_json("mdsearch_config", mdsearch_config, obj);
+  int rs;
+  JSONDecoder::decode_json("reshard_status", rs, obj);
+  reshard_status = (cls_rgw_reshard_status)rs;
+  JSONDecoder::decode_json("new_bucket_instance_id",new_bucket_instance_id, obj);
 }
 
 void rgw_obj_key::dump(Formatter *f) const
@@ -768,6 +789,13 @@ void rgw_obj_key::dump(Formatter *f) const
   encode_json("name", name, f);
   encode_json("instance", instance, f);
   encode_json("ns", ns, f);
+}
+
+void rgw_obj_key::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("name", name, obj);
+  JSONDecoder::decode_json("instance", instance, obj);
+  JSONDecoder::decode_json("ns", ns, obj);
 }
 
 void RGWBucketEnt::dump(Formatter *f) const
@@ -778,6 +806,7 @@ void RGWBucketEnt::dump(Formatter *f) const
   utime_t ut(creation_time);
   encode_json("mtime", ut, f); /* mtime / creation time discrepency needed for backward compatibility */
   encode_json("count", count, f);
+  encode_json("placement_rule", placement_rule, f);
 }
 
 void RGWUploadPartInfo::dump(Formatter *f) const
@@ -884,6 +913,7 @@ void RGWZoneParams::dump(Formatter *f) const
   encode_json("log_pool", log_pool, f);
   encode_json("intent_log_pool", intent_log_pool, f);
   encode_json("usage_log_pool", usage_log_pool, f);
+  encode_json("reshard_pool", reshard_pool, f);
   encode_json("user_keys_pool", user_keys_pool, f);
   encode_json("user_email_pool", user_email_pool, f);
   encode_json("user_swift_pool", user_swift_pool, f);
@@ -924,6 +954,7 @@ void RGWZoneParams::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("lc_pool", lc_pool, obj);
   JSONDecoder::decode_json("log_pool", log_pool, obj);
   JSONDecoder::decode_json("intent_log_pool", intent_log_pool, obj);
+  JSONDecoder::decode_json("reshard_pool", reshard_pool, obj);
   JSONDecoder::decode_json("usage_log_pool", usage_log_pool, obj);
   JSONDecoder::decode_json("user_keys_pool", user_keys_pool, obj);
   JSONDecoder::decode_json("user_email_pool", user_email_pool, obj);
@@ -964,7 +995,7 @@ void RGWZone::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("bucket_index_max_shards", bucket_index_max_shards, obj);
   JSONDecoder::decode_json("read_only", read_only, obj);
   JSONDecoder::decode_json("tier_type", tier_type, obj);
-  JSONDecoder::decode_json("sync_from_all", sync_from_all, obj);
+  JSONDecoder::decode_json("sync_from_all", sync_from_all, true, obj);
   JSONDecoder::decode_json("sync_from", sync_from, obj);
 }
 
@@ -1319,6 +1350,65 @@ void rgw_sync_error_info::dump(Formatter *f) const {
   encode_json("source_zone", source_zone, f);
   encode_json("error_code", error_code, f);
   encode_json("message", message, f);
+}
+
+void rgw_bucket_shard_full_sync_marker::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("position", position, obj);
+  JSONDecoder::decode_json("count", count, obj);
+}
+
+void rgw_bucket_shard_full_sync_marker::dump(Formatter *f) const
+{
+  encode_json("position", position, f);
+  encode_json("count", count, f);
+}
+
+void rgw_bucket_shard_inc_sync_marker::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("position", position, obj);
+}
+
+void rgw_bucket_shard_inc_sync_marker::dump(Formatter *f) const
+{
+  encode_json("position", position, f);
+}
+
+void rgw_bucket_shard_sync_info::decode_json(JSONObj *obj)
+{
+  std::string s;
+  JSONDecoder::decode_json("status", s, obj);
+  if (s == "full-sync") {
+    state = StateFullSync;
+  } else if (s == "incremental-sync") {
+    state = StateIncrementalSync;
+  } else {
+    state = StateInit;
+  }
+  JSONDecoder::decode_json("full_marker", full_marker, obj);
+  JSONDecoder::decode_json("inc_marker", inc_marker, obj);
+}
+
+void rgw_bucket_shard_sync_info::dump(Formatter *f) const
+{
+  const char *s{nullptr};
+  switch ((SyncState)state) {
+    case StateInit:
+    s = "init";
+    break;
+  case StateFullSync:
+    s = "full-sync";
+    break;
+  case StateIncrementalSync:
+    s = "incremental-sync";
+    break;
+  default:
+    s = "unknown";
+    break;
+  }
+  encode_json("status", s, f);
+  encode_json("full_marker", full_marker, f);
+  encode_json("inc_marker", inc_marker, f);
 }
 
 /* This utility function shouldn't conflict with the overload of std::to_string

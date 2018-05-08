@@ -624,18 +624,34 @@ class MonitorDBStore
       db->init(g_conf->mon_rocksdb_options);
     else
       db->init();
+
+
   }
 
   int open(ostream &out) {
     string kv_type;
     int r = read_meta("kv_backend", &kv_type);
-    if (r < 0 || kv_type.length() == 0)
+    if (r < 0 || kv_type.empty()) {
+      // assume old monitors that did not mark the type were leveldb.
       kv_type = "leveldb";
-
+      r = write_meta("kv_backend", kv_type);
+      if (r < 0)
+	return r;
+    }
     _open(kv_type);
     r = db->open(out);
     if (r < 0)
       return r;
+
+    // Monitors are few in number, so the resource cost of exposing 
+    // very detailed stats is low: ramp up the priority of all the
+    // KV store's perf counters.  Do this after open, because backend may
+    // not have constructed PerfCounters earlier.
+    if (db->get_perf_counters()) {
+      db->get_perf_counters()->set_prio_adjust(
+          PerfCountersBuilder::PRIO_USEFUL - PerfCountersBuilder::PRIO_DEBUGONLY);
+    }
+
     io_work.start();
     is_open = true;
     return 0;
@@ -646,8 +662,7 @@ class MonitorDBStore
     string kv_type;
     int r = read_meta("kv_backend", &kv_type);
     if (r < 0) {
-      // assume old monitors that did not mark the type were leveldb.
-      kv_type = "leveldb";
+      kv_type = g_conf->mon_keyvaluedb;
       r = write_meta("kv_backend", kv_type);
       if (r < 0)
 	return r;

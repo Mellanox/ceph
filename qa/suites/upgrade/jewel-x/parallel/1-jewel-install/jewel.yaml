@@ -1,3 +1,22 @@
+overrides:
+  ceph:
+    conf:
+      client.0:
+        debug ms: 1
+        debug client: 10
+        debug monc: 10
+      client.1:
+        debug ms: 1
+        debug client: 10
+        debug monc: 10
+      client.2:
+        debug ms: 1
+        debug client: 10
+        debug monc: 10
+      client.3:
+        debug ms: 1
+        debug client: 10
+        debug monc: 10
 meta:
 - desc: |
    install ceph/jewel latest
@@ -10,6 +29,23 @@ tasks:
 - print: "**** done installing jewel"
 - ceph:
     skip_mgr_daemons: true
+    add_osds_to_crush: true
+    log-whitelist:
+      - overall HEALTH_
+      - \(FS_
+      - \(MDS_
+      - \(OSD_
+      - \(MON_DOWN\)
+      - \(CACHE_POOL_
+      - \(POOL_
+      - \(MGR_DOWN\)
+      - \(PG_
+      - Monitor daemon marked osd
+      - Behind on trimming
+      - is unresponsive
+    conf:
+      global:
+        mon warn on pool no app: false
 - print: "**** done ceph"
 - install.upgrade:
     mon.a:

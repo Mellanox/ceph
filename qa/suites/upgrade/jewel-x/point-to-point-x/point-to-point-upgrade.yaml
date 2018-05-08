@@ -16,18 +16,27 @@ overrides:
     - scrub
     - osd_map_max_advance
     - wrongly marked
+    - overall HEALTH_
+    - \(MGR_DOWN\)
+    - \(OSD_
+    - \(PG_
+    - \(CACHE_
     fs: xfs
     conf:
+      global:
+        mon warn on pool no app: false
       mon:
         mon debug unsafe allow tier with nonempty snaps: true
       osd:
         osd map max advance: 1000
+        osd map cache size: 1100
 roles:
 - - mon.a
   - mds.a
   - osd.0
   - osd.1
   - osd.2
+  - mgr.x
 - - mon.b
   - mon.c
   - osd.3
@@ -47,6 +56,8 @@ tasks:
 - print: "**** done v10.2.0 install"
 - ceph:
    fs: xfs
+   skip_mgr_daemons: true
+   add_osds_to_crush: true
 - print: "**** done ceph xfs"
 - sequential:
    - workload
@@ -77,6 +88,9 @@ tasks:
    - workload_x
    - upgrade-sequence_x
 - print: "**** done parallel -x branch"
+- exec:
+    osd.0:
+      - ceph osd set-require-min-compat-client luminous
 # Run librados tests on the -x upgraded cluster
 - install.upgrade:
     client.1:
@@ -154,7 +168,7 @@ workload_x:
        branch: jewel
        clients:
          client.1:
-         - rados/test-upgrade-v11.0.0.sh
+         - rados/test-upgrade-v11.0.0-noec.sh
          - cls
        env:
          CLS_RBD_GTEST_FILTER: '*:-TestClsRbd.mirror_image'
@@ -163,7 +177,7 @@ workload_x:
        branch: jewel
        clients:
          client.0:
-         - rados/test-upgrade-v11.0.0.sh
+         - rados/test-upgrade-v11.0.0-noec.sh
          - cls
    - print: "**** done rados/test-upgrade-v11.0.0.sh &  cls workload_x upgraded client"
    - rgw: [client.1]
@@ -207,4 +221,16 @@ upgrade-sequence_x:
        daemons: [osd.5]
        wait-for-healthy: false
        wait-for-up-osds: true
+   - exec:
+      mgr.x:
+        - mkdir -p /var/lib/ceph/mgr/ceph-x
+        - ceph auth get-or-create-key mgr.x mon 'allow profile mgr'
+        - ceph auth export mgr.x > /var/lib/ceph/mgr/ceph-x/keyring
+   - ceph.restart:
+       daemons: [mgr.x]
+       wait-for-healthy: false
+   - exec:
+       osd.0:
+         - ceph osd require-osd-release luminous
+   - ceph.healthy:
    - print: "**** done ceph.restart all -x branch mds/osd/mon"

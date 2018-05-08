@@ -79,7 +79,8 @@ PurgeQueue::PurgeQueue(
     max_purge_ops(0),
     drain_initial(0),
     draining(false),
-    delayed_flush(nullptr)
+    delayed_flush(nullptr),
+    recovered(false)
 {
   assert(cct != nullptr);
   assert(on_error != nullptr);
@@ -100,7 +101,8 @@ void PurgeQueue::create_logger()
           "purge_queue", l_pq_first, l_pq_last);
   pcb.add_u64(l_pq_executing_ops, "pq_executing_ops", "Purge queue ops in flight");
   pcb.add_u64(l_pq_executing, "pq_executing", "Purge queue tasks in flight");
-  pcb.add_u64_counter(l_pq_executed, "pq_executed", "Purge queue tasks executed", "purg");
+  pcb.add_u64_counter(l_pq_executed, "pq_executed", "Purge queue tasks executed", "purg",
+      PerfCountersBuilder::PRIO_INTERESTING);
 
   logger.reset(pcb.create_perf_counters());
   g_ceph_context->get_perfcounters_collection()->add(logger.get());
@@ -114,6 +116,21 @@ void PurgeQueue::init()
 
   finisher.start();
   timer.init();
+}
+
+void PurgeQueue::activate()
+{
+  Mutex::Locker l(lock);
+  if (journaler.get_read_pos() == journaler.get_write_pos())
+    return;
+
+  if (in_flight.empty()) {
+    dout(4) << "start work (by drain)" << dendl;
+    finisher.queue(new FunctionContext([this](int r) {
+	  Mutex::Locker l(lock);
+	  _consume();
+	  }));
+  }
 }
 
 void PurgeQueue::shutdown()
@@ -131,11 +148,14 @@ void PurgeQueue::open(Context *completion)
 
   Mutex::Locker l(lock);
 
-  journaler.recover(new FunctionContext([this, completion](int r){
+  if (completion)
+    waiting_for_recovery.push_back(completion);
+
+  journaler.recover(new FunctionContext([this](int r){
     if (r == -ENOENT) {
       dout(1) << "Purge Queue not found, assuming this is an upgrade and "
                  "creating it." << dendl;
-      create(completion);
+      create(NULL);
     } else if (r == 0) {
       Mutex::Locker l(lock);
       dout(4) << "open complete" << dendl;
@@ -146,12 +166,13 @@ void PurgeQueue::open(Context *completion)
       if (journaler.last_committed.write_pos < journaler.get_write_pos()) {
 	dout(4) << "recovering write_pos" << dendl;
 	journaler.set_read_pos(journaler.last_committed.write_pos);
-	_recover(completion);
+	_recover();
 	return;
       }
 
       journaler.set_writeable();
-      completion->complete(0);
+      recovered = true;
+      finish_contexts(g_ceph_context, waiting_for_recovery);
     } else {
       derr << "Error " << r << " loading Journaler" << dendl;
       on_error->complete(r);
@@ -159,8 +180,16 @@ void PurgeQueue::open(Context *completion)
   }));
 }
 
+void PurgeQueue::wait_for_recovery(Context* c)
+{
+  Mutex::Locker l(lock);
+  if (recovered)
+    c->complete(0);
+  else
+    waiting_for_recovery.push_back(c);
+}
 
-void PurgeQueue::_recover(Context *completion)
+void PurgeQueue::_recover()
 {
   assert(lock.is_locked_by_me());
 
@@ -169,9 +198,9 @@ void PurgeQueue::_recover(Context *completion)
     if (!journaler.is_readable() &&
 	!journaler.get_error() &&
 	journaler.get_read_pos() < journaler.get_write_pos()) {
-      journaler.wait_for_readable(new FunctionContext([this, completion](int r) {
+      journaler.wait_for_readable(new FunctionContext([this](int r) {
         Mutex::Locker l(lock);
-	_recover(completion);
+	_recover();
       }));
       return;
     }
@@ -188,7 +217,8 @@ void PurgeQueue::_recover(Context *completion)
       // restore original read_pos
       journaler.set_read_pos(journaler.last_committed.expire_pos);
       journaler.set_writeable();
-      completion->complete(0);
+      recovered = true;
+      finish_contexts(g_ceph_context, waiting_for_recovery);
       return;
     }
 
@@ -203,11 +233,18 @@ void PurgeQueue::create(Context *fin)
   dout(4) << "creating" << dendl;
   Mutex::Locker l(lock);
 
+  if (fin)
+    waiting_for_recovery.push_back(fin);
+
   file_layout_t layout = file_layout_t::get_default();
   layout.pool_id = metadata_pool;
   journaler.set_writeable();
   journaler.create(&layout, JOURNAL_FORMAT_RESILIENT);
-  journaler.write_head(fin);
+  journaler.write_head(new FunctionContext([this](int r) {
+    Mutex::Locker l(lock);
+    recovered = true;
+    finish_contexts(g_ceph_context, waiting_for_recovery);
+  }));
 }
 
 /**
@@ -445,21 +482,12 @@ void PurgeQueue::_execute_item(
   }
   assert(gather.has_subs());
 
-  gather.set_finisher(new FunctionContext([this, expire_to](int r){
-    if (lock.is_locked_by_me()) {
-      // Fast completion, Objecter ops completed before we hit gather.activate()
-      // and we're being called inline.  We are still inside _consume so
-      // no need to call back into it.
-      _execute_item_complete(expire_to);
-    } else {
-      // Normal completion, we're being called back from outside PurgeQueue::lock
-      // by the Objecter.  Take the lock, and call back into _consume to
-      // find more work.
-      Mutex::Locker l(lock);
-      _execute_item_complete(expire_to);
+  gather.set_finisher(new C_OnFinisher(
+                      new FunctionContext([this, expire_to](int r){
+    Mutex::Locker l(lock);
+    _execute_item_complete(expire_to);
 
-      _consume();
-    }
+    _consume();
 
     // Have we gone idle?  If so, do an extra write_head now instead of
     // waiting for next flush after journaler_write_head_interval.
@@ -471,7 +499,8 @@ void PurgeQueue::_execute_item(
             journaler.trim();
             }));
     }
-  }));
+  }), &finisher));
+
   gather.activate();
 }
 
@@ -515,7 +544,7 @@ void PurgeQueue::update_op_limit(const MDSMap &mds_map)
   uint64_t pg_count = 0;
   objecter->with_osdmap([&](const OSDMap& o) {
     // Number of PGs across all data pools
-    const std::set<int64_t> &data_pools = mds_map.get_data_pools();
+    const std::vector<int64_t> &data_pools = mds_map.get_data_pools();
     for (const auto dp : data_pools) {
       if (o.get_pg_pool(dp) == NULL) {
         // It is possible that we have an older OSDMap than MDSMap,

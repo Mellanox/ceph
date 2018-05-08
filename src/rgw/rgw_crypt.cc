@@ -9,7 +9,7 @@
 #include <rgw/rgw_b64.h>
 #include <rgw/rgw_rest_s3.h>
 #include "include/assert.h"
-#include <boost/utility/string_ref.hpp>
+#include <boost/utility/string_view.hpp>
 #include <rgw/rgw_keystone.h>
 #include "include/str_map.h"
 #include "crypto/crypto_accel.h"
@@ -713,61 +713,23 @@ int RGWGetObj_BlockDecrypt::handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_l
     part_ofs -= parts_len[i];
     i++;
   }
-  if (cache.length() > 0) {
-    //append before operation.
-    off_t append_size = block_size - cache.length();
-    if (append_size > bl_len)
-      append_size = bl_len;
-    char *src = bl.get_contiguous(bl_ofs, append_size);
-    cache.append(src,append_size);
-    bl_ofs += append_size;
-    bl_len -= append_size;
-
-    if (cache.length() == block_size) {
-      bufferlist data;
-      if (! crypt->decrypt(cache, 0, block_size, data, part_ofs) ) {
-        return -ERR_INTERNAL_ERROR;
-      }
-      part_ofs += block_size;
-
-      off_t send_size = block_size - enc_begin_skip;
-      if (ofs + enc_begin_skip + send_size > end + 1) {
-        send_size = end + 1 - ofs - enc_begin_skip;
-      }
-      res = next->handle_data(data, enc_begin_skip, send_size);
-
-      enc_begin_skip = 0;
-      cache.clear();
-      ofs += block_size;
-      if (res != 0)
-        return res;
+  bl.copy(bl_ofs, bl_len, cache);
+  off_t aligned_size = cache.length() & ~(block_size - 1);
+  if (aligned_size > 0) {
+    bufferlist data;
+    if (! crypt->decrypt(cache, 0, aligned_size, data, part_ofs) ) {
+      return -ERR_INTERNAL_ERROR;
     }
+    off_t send_size = aligned_size - enc_begin_skip;
+    if (ofs + enc_begin_skip + send_size > end + 1) {
+      send_size = end + 1 - ofs - enc_begin_skip;
+    }
+    res = next->handle_data(data, enc_begin_skip, send_size);
+    enc_begin_skip = 0;
+    ofs += aligned_size;
+    cache.splice(0, aligned_size);
   }
-  if (bl_len > 0) {
-    off_t aligned_size = bl_len & ~(block_size - 1);
-    //save remainder
-    off_t remainder = bl_len - aligned_size;
-    if(remainder > 0) {
-      bl.copy(bl_ofs + aligned_size, remainder, cache);
-    }
-    if (aligned_size > 0) {
-      bufferlist data;
-      if (! crypt->decrypt(bl, bl_ofs, aligned_size, data, part_ofs) ) {
-        return -ERR_INTERNAL_ERROR;
-      }
-      part_ofs += aligned_size;
-      off_t send_size = aligned_size - enc_begin_skip;
-      if (ofs + enc_begin_skip + send_size > end + 1) {
-        send_size = end + 1 - ofs - enc_begin_skip;
-      }
-      res = next->handle_data(data, enc_begin_skip, send_size);
-      enc_begin_skip = 0;
-      ofs += aligned_size;
-      if (res != 0)
-        return res;
-    }
-  }
-  return 0;
+  return res;
 }
 
 /**
@@ -830,62 +792,27 @@ int RGWPutObj_BlockEncrypt::handle_data(bufferlist& bl,
     }
     return res;
   }
-  off_t bl_ofs = 0;
-  if (cache.length() > 0) {
-    //append before operation.
-    off_t size = block_size - cache.length();
-    if (size > bl.length())
-      size = bl.length();
-    if (size > 0) {
-      char *src = bl.get_contiguous(0, size);
-      cache.append(src,size);
-      bl_ofs += size;
-    }
-    if (cache.length() == block_size) {
-      bufferlist data;
-      if (! crypt->encrypt(cache, 0, block_size, data, ofs)) {
-        return -ERR_INTERNAL_ERROR;
-      }
-      res = next->handle_data(data, ofs, phandle, pobj, again);
-      cache.clear();
-      ofs += block_size;
-      if (res != 0)
-        return res;
-    }
-  }
-  if (bl_ofs < bl.length()) {
-    off_t aligned_size = (bl.length() - bl_ofs) & ~(block_size - 1);
-    //save remainder
-    off_t remainder = (bl.length() - bl_ofs) - aligned_size;
-    if(remainder > 0) {
-      bl.copy(bl_ofs + aligned_size, remainder, cache);
-    }
-    if (aligned_size > 0) {
-      bufferlist data;
-      if (! crypt->encrypt(bl, bl_ofs, aligned_size, data, ofs) ) {
-        return -ERR_INTERNAL_ERROR;
-      }
-      res=next->handle_data(data, ofs, phandle, pobj, again);
-      ofs += aligned_size;
-      if (res != 0)
-        return res;
-    }
-  }
+
+  cache.append(bl);
+  off_t proc_size = cache.length() & ~(block_size - 1);
   if (bl.length() == 0) {
-    if (cache.length() > 0) {
-      /*flush cached data*/
-      bufferlist data;
-      if (! crypt->encrypt(cache, 0, cache.length(), data, ofs) ) {
-        return -ERR_INTERNAL_ERROR;
-      }
-      res = next->handle_data(data, ofs, phandle, pobj, again);
-      ofs += cache.length();
-      cache.clear();
-      if (res != 0)
-        return res;
+    proc_size = cache.length();
+  }
+  if (proc_size > 0) {
+    bufferlist data;
+    if (! crypt->encrypt(cache, 0, proc_size, data, ofs) ) {
+      return -ERR_INTERNAL_ERROR;
     }
+    res = next->handle_data(data, ofs, phandle, pobj, again);
+    ofs += proc_size;
+    cache.splice(0, proc_size);
+    if (res < 0)
+      return res;
+  }
+
+  if (bl.length() == 0) {
     /*replicate 0-sized handle_data*/
-    res = next->handle_data(cache, ofs, phandle, pobj, again);
+    res = next->handle_data(bl, ofs, phandle, pobj, again);
   }
   return res;
 }
@@ -923,8 +850,8 @@ static int get_barbican_url(CephContext * const cct,
 }
 
 static int request_key_from_barbican(CephContext *cct,
-                              boost::string_ref key_id,
-                              boost::string_ref key_selector,
+                              boost::string_view key_id,
+                              boost::string_view key_selector,
                               const std::string& barbican_token,
                               std::string& actual_key) {
   std::string secret_url;
@@ -967,8 +894,8 @@ static map<string,string> get_str_map(const string &str) {
 }
 
 static int get_actual_key_from_kms(CephContext *cct,
-                            boost::string_ref key_id,
-                            boost::string_ref key_selector,
+                            boost::string_view key_id,
+                            boost::string_view key_selector,
                             std::string& actual_key)
 {
   int res = 0;
@@ -978,7 +905,16 @@ static int get_actual_key_from_kms(CephContext *cct,
 
   map<string, string>::iterator it = str_map.find(std::string(key_id));
   if (it != str_map.end() ) {
-    std::string master_key = from_base64((*it).second);
+    std::string master_key;
+    try {
+      master_key = from_base64((*it).second);
+    } catch (...) {
+      ldout(cct, 5) << "ERROR: get_actual_key_from_kms invalid encryption key id "
+                    << "which contains character that is not base64 encoded."
+                    << dendl;
+      return -EINVAL;
+    }
+
     if (master_key.length() == AES_256_KEYSIZE) {
       uint8_t _actual_key[AES_256_KEYSIZE];
       if (AES_256_ECB_encrypt(cct,
@@ -1012,7 +948,7 @@ static int get_actual_key_from_kms(CephContext *cct,
 
 static inline void set_attr(map<string, bufferlist>& attrs,
                             const char* key,
-                            boost::string_ref value)
+                            boost::string_view value)
 {
   bufferlist bl;
   bl.append(value.data(), value.size());
@@ -1051,8 +987,8 @@ static const crypt_option_names crypt_options[] = {
     {"HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID",      "x-amz-server-side-encryption-aws-kms-key-id"},
 };
 
-static boost::string_ref get_crypt_attribute(
-    RGWEnv* env,
+static boost::string_view get_crypt_attribute(
+    const RGWEnv* env,
     std::map<std::string,
              RGWPostObj_ObjStore::post_form_part,
              const ltstr_nocase>* parts,
@@ -1065,16 +1001,16 @@ static boost::string_ref get_crypt_attribute(
     auto iter
       = parts->find(crypt_options[option].post_part_name);
     if (iter == parts->end())
-      return boost::string_ref();
+      return boost::string_view();
     bufferlist& data = iter->second.data;
-    boost::string_ref str = boost::string_ref(data.c_str(), data.length());
+    boost::string_view str = boost::string_view(data.c_str(), data.length());
     return rgw_trim_whitespace(str);
   } else {
     const char* hdr = env->get(crypt_options[option].http_header_name, nullptr);
     if (hdr != nullptr) {
-      return boost::string_ref(hdr);
+      return boost::string_view(hdr);
     } else {
-      return boost::string_ref();
+      return boost::string_view();
     }
   }
 }
@@ -1091,34 +1027,73 @@ int rgw_s3_prepare_encrypt(struct req_state* s,
   int res = 0;
   crypt_http_responses.clear();
   {
-    boost::string_ref req_sse_ca =
+    boost::string_view req_sse_ca =
         get_crypt_attribute(s->info.env, parts, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM);
     if (! req_sse_ca.empty()) {
       if (req_sse_ca != "AES256") {
-        return -ERR_INVALID_REQUEST;
+        ldout(s->cct, 5) << "ERROR: Invalid value for header "
+                         << "x-amz-server-side-encryption-customer-algorithm"
+                         << dendl;
+        s->err.message = "The requested encryption algorithm is not valid, must be AES256.";
+        return -ERR_INVALID_ENCRYPTION_ALGORITHM;
       }
       if (s->cct->_conf->rgw_crypt_require_ssl &&
           !s->info.env->exists("SERVER_PORT_SECURE")) {
+        ldout(s->cct, 5) << "ERROR: Insecure request, rgw_crypt_require_ssl is set" << dendl;
         return -ERR_INVALID_REQUEST;
       }
-      std::string key_bin = from_base64(
+
+      std::string key_bin;
+      try {
+        key_bin = from_base64(
           get_crypt_attribute(s->info.env, parts, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY) );
+      } catch (...) {
+        ldout(s->cct, 5) << "ERROR: rgw_s3_prepare_encrypt invalid encryption "
+                         << "key which contains character that is not base64 encoded."
+                         << dendl;
+        s->err.message = "Requests specifying Server Side Encryption with Customer "
+                         "provided keys must provide an appropriate secret key.";
+        return -EINVAL;
+      }
+
       if (key_bin.size() != AES_256_CBC::AES_256_KEYSIZE) {
-        return -ERR_INVALID_REQUEST;
+        ldout(s->cct, 5) << "ERROR: invalid encryption key size" << dendl;
+        s->err.message = "Requests specifying Server Side Encryption with Customer "
+                         "provided keys must provide an appropriate secret key.";
+        return -EINVAL;
       }
-      boost::string_ref keymd5 =
+
+      boost::string_view keymd5 =
           get_crypt_attribute(s->info.env, parts, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5);
-      std::string keymd5_bin = from_base64(keymd5);
-      if (keymd5_bin.size() != CEPH_CRYPTO_MD5_DIGESTSIZE) {
-        return -ERR_INVALID_DIGEST;
+
+      std::string keymd5_bin;
+      try {
+        keymd5_bin = from_base64(keymd5);
+      } catch (...) {
+        ldout(s->cct, 5) << "ERROR: rgw_s3_prepare_encrypt invalid encryption key "
+                         << "md5 which contains character that is not base64 encoded."
+                         << dendl;
+        s->err.message = "Requests specifying Server Side Encryption with Customer "
+                         "provided keys must provide an appropriate secret key md5.";
+        return -EINVAL;
       }
+
+      if (keymd5_bin.size() != CEPH_CRYPTO_MD5_DIGESTSIZE) {
+        ldout(s->cct, 5) << "ERROR: Invalid key md5 size" << dendl;
+        s->err.message = "Requests specifying Server Side Encryption with Customer "
+                         "provided keys must provide an appropriate secret key md5.";
+        return -EINVAL;
+      }
+
       MD5 key_hash;
       byte key_hash_res[CEPH_CRYPTO_MD5_DIGESTSIZE];
       key_hash.Update(reinterpret_cast<const byte*>(key_bin.c_str()), key_bin.size());
       key_hash.Final(key_hash_res);
 
       if (memcmp(key_hash_res, keymd5_bin.c_str(), CEPH_CRYPTO_MD5_DIGESTSIZE) != 0) {
-        return -ERR_INVALID_DIGEST;
+        ldout(s->cct, 5) << "ERROR: Invalid key md5 hash" << dendl;
+        s->err.message = "The calculated MD5 hash of the key did not match the hash that was provided.";
+        return -EINVAL;
       }
 
       set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-C-AES256");
@@ -1133,32 +1108,67 @@ int rgw_s3_prepare_encrypt(struct req_state* s,
       crypt_http_responses["x-amz-server-side-encryption-customer-algorithm"] = "AES256";
       crypt_http_responses["x-amz-server-side-encryption-customer-key-MD5"] = keymd5.to_string();
       return 0;
+    } else {
+      boost::string_view customer_key =
+          get_crypt_attribute(s->info.env, parts, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY);
+      if (!customer_key.empty()) {
+        ldout(s->cct, 5) << "ERROR: SSE-C encryption request is missing the header "
+                         << "x-amz-server-side-encryption-customer-algorithm"
+                         << dendl;
+        s->err.message = "Requests specifying Server Side Encryption with Customer "
+                         "provided keys must provide a valid encryption algorithm.";
+        return -EINVAL;
+      }
+
+      boost::string_view customer_key_md5 =
+          get_crypt_attribute(s->info.env, parts, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5);
+      if (!customer_key_md5.empty()) {
+        ldout(s->cct, 5) << "ERROR: SSE-C encryption request is missing the header "
+                         << "x-amz-server-side-encryption-customer-algorithm"
+                         << dendl;
+        s->err.message = "Requests specifying Server Side Encryption with Customer "
+                         "provided keys must provide a valid encryption algorithm.";
+        return -EINVAL;
+      }
     }
+
     /* AMAZON server side encryption with KMS (key management service) */
-    boost::string_ref req_sse =
+    boost::string_view req_sse =
         get_crypt_attribute(s->info.env, parts, X_AMZ_SERVER_SIDE_ENCRYPTION);
     if (! req_sse.empty()) {
       if (req_sse != "aws:kms") {
-        return -ERR_INVALID_REQUEST;
+        ldout(s->cct, 5) << "ERROR: Invalid value for header x-amz-server-side-encryption"
+                         << dendl;
+        s->err.message = "Server Side Encryption with KMS managed key requires "
+                         "HTTP header x-amz-server-side-encryption : aws:kms";
+        return -EINVAL;
       }
       if (s->cct->_conf->rgw_crypt_require_ssl &&
           !s->info.env->exists("SERVER_PORT_SECURE")) {
+        ldout(s->cct, 5) << "ERROR: insecure request, rgw_crypt_require_ssl is set" << dendl;
         return -ERR_INVALID_REQUEST;
       }
-      boost::string_ref key_id =
+      boost::string_view key_id =
           get_crypt_attribute(s->info.env, parts, X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID);
       if (key_id.empty()) {
+        ldout(s->cct, 5) << "ERROR: not provide a valid key id" << dendl;
+        s->err.message = "Server Side Encryption with KMS managed key requires "
+                         "HTTP header x-amz-server-side-encryption-aws-kms-key-id";
         return -ERR_INVALID_ACCESS_KEY;
       }
       /* try to retrieve actual key */
       std::string key_selector = create_random_key_selector(s->cct);
       std::string actual_key;
       res = get_actual_key_from_kms(s->cct, key_id, key_selector, actual_key);
-      if (res != 0)
+      if (res != 0) {
+        ldout(s->cct, 5) << "ERROR: failed to retrieve actual key from key_id: " << key_id << dendl;
+        s->err.message = "Failed to retrieve the actual key, kms-keyid: " + key_id.to_string();
         return res;
+      }
       if (actual_key.size() != AES_256_KEYSIZE) {
         ldout(s->cct, 5) << "ERROR: key obtained from key_id:" <<
             key_id << " is not 256 bit size" << dendl;
+        s->err.message = "KMS provided an invalid key for the given kms-keyid.";
         return -ERR_INVALID_ACCESS_KEY;
       }
       set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-KMS");
@@ -1171,13 +1181,37 @@ int rgw_s3_prepare_encrypt(struct req_state* s,
         *block_crypt = std::move(aes);
       }
       actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
+
+      crypt_http_responses["x-amz-server-side-encryption"] = "aws:kms";
+      crypt_http_responses["x-amz-server-side-encryption-aws-kms-key-id"] = key_id.to_string();
       return 0;
+    } else {
+      boost::string_view key_id =
+          get_crypt_attribute(s->info.env, parts, X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID);
+      if (!key_id.empty()) {
+        ldout(s->cct, 5) << "ERROR: SSE-KMS encryption request is missing the header "
+                         << "x-amz-server-side-encryption"
+                         << dendl;
+        s->err.message = "Server Side Encryption with KMS managed key requires "
+                         "HTTP header x-amz-server-side-encryption : aws:kms";
+        return -EINVAL;
+      }
     }
 
     /* no other encryption mode, check if default encryption is selected */
     if (s->cct->_conf->rgw_crypt_default_encryption_key != "") {
-      std::string master_encryption_key =
-          from_base64(s->cct->_conf->rgw_crypt_default_encryption_key);
+      std::string master_encryption_key;
+      try {
+        master_encryption_key = from_base64(s->cct->_conf->rgw_crypt_default_encryption_key);
+      } catch (...) {
+        ldout(s->cct, 5) << "ERROR: rgw_s3_prepare_encrypt invalid default encryption key "
+                         << "which contains character that is not base64 encoded."
+                         << dendl;
+        s->err.message = "Requests specifying Server Side Encryption with Customer "
+                         "provided keys must provide an appropriate secret key.";
+        return -EINVAL;
+      }
+
       if (master_encryption_key.size() != 256 / 8) {
         ldout(s->cct, 0) << "ERROR: failed to decode 'rgw crypt default encryption key' to 256 bit string" << dendl;
         /* not an error to return; missing encryption does not inhibit processing */
@@ -1218,29 +1252,73 @@ int rgw_s3_prepare_decrypt(struct req_state* s,
   int res = 0;
   std::string stored_mode = get_str_attribute(attrs, RGW_ATTR_CRYPT_MODE);
   ldout(s->cct, 15) << "Encryption mode: " << stored_mode << dendl;
+
+  const char *req_sse = s->info.env->get("HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION", NULL);
+  if (nullptr != req_sse && (s->op == OP_GET || s->op == OP_HEAD)) {
+    return -ERR_INVALID_REQUEST;
+  }
+
   if (stored_mode == "SSE-C-AES256") {
     if (s->cct->_conf->rgw_crypt_require_ssl &&
         !s->info.env->exists("SERVER_PORT_SECURE")) {
+      ldout(s->cct, 5) << "ERROR: Insecure request, rgw_crypt_require_ssl is set" << dendl;
       return -ERR_INVALID_REQUEST;
     }
     const char *req_cust_alg =
         s->info.env->get("HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM", NULL);
 
-    if ((nullptr == req_cust_alg) || (strcmp(req_cust_alg, "AES256") != 0)) {
-      return -ERR_INVALID_REQUEST;
+    if (nullptr == req_cust_alg)  {
+      ldout(s->cct, 5) << "ERROR: Request for SSE-C encrypted object missing "
+                       << "x-amz-server-side-encryption-customer-algorithm"
+                       << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide a valid encryption algorithm.";
+      return -EINVAL;
+    } else if (strcmp(req_cust_alg, "AES256") != 0) {
+      ldout(s->cct, 5) << "ERROR: The requested encryption algorithm is not valid, must be AES256." << dendl;
+      s->err.message = "The requested encryption algorithm is not valid, must be AES256.";
+      return -ERR_INVALID_ENCRYPTION_ALGORITHM;
     }
 
-    std::string key_bin =
-        from_base64(s->info.env->get("HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY", ""));
+    std::string key_bin;
+    try {
+      key_bin = from_base64(s->info.env->get("HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY", ""));
+    } catch (...) {
+      ldout(s->cct, 5) << "ERROR: rgw_s3_prepare_decrypt invalid encryption key "
+                       << "which contains character that is not base64 encoded."
+                       << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide an appropriate secret key.";
+      return -EINVAL;
+    }
+
     if (key_bin.size() != AES_256_CBC::AES_256_KEYSIZE) {
-      return -ERR_INVALID_REQUEST;
+      ldout(s->cct, 5) << "ERROR: Invalid encryption key size" << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide an appropriate secret key.";
+      return -EINVAL;
     }
 
     std::string keymd5 =
         s->info.env->get("HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5", "");
-    std::string keymd5_bin = from_base64(keymd5);
+    std::string keymd5_bin;
+    try {
+      keymd5_bin = from_base64(keymd5);
+    } catch (...) {
+      ldout(s->cct, 5) << "ERROR: rgw_s3_prepare_decrypt invalid encryption key md5 "
+                       << "which contains character that is not base64 encoded."
+                       << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide an appropriate secret key md5.";
+      return -EINVAL;
+    }
+
+
     if (keymd5_bin.size() != CEPH_CRYPTO_MD5_DIGESTSIZE) {
-      return -ERR_INVALID_DIGEST;
+      ldout(s->cct, 5) << "ERROR: Invalid key md5 size " << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide an appropriate secret key md5.";
+      return -EINVAL;
     }
 
     MD5 key_hash;
@@ -1250,7 +1328,8 @@ int rgw_s3_prepare_decrypt(struct req_state* s,
 
     if ((memcmp(key_hash_res, keymd5_bin.c_str(), CEPH_CRYPTO_MD5_DIGESTSIZE) != 0) ||
         (get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYMD5) != keymd5_bin)) {
-      return -ERR_INVALID_DIGEST;
+      s->err.message = "The calculated MD5 hash of the key did not match the hash that was provided.";
+      return -EINVAL;
     }
     auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s->cct));
     aes->set_key(reinterpret_cast<const uint8_t*>(key_bin.c_str()), AES_256_CBC::AES_256_KEYSIZE);
@@ -1264,6 +1343,7 @@ int rgw_s3_prepare_decrypt(struct req_state* s,
   if (stored_mode == "SSE-KMS") {
     if (s->cct->_conf->rgw_crypt_require_ssl &&
         !s->info.env->exists("SERVER_PORT_SECURE")) {
+      ldout(s->cct, 5) << "ERROR: Insecure request, rgw_crypt_require_ssl is set" << dendl;
       return -ERR_INVALID_REQUEST;
     }
     /* try to retrieve actual key */
@@ -1272,12 +1352,14 @@ int rgw_s3_prepare_decrypt(struct req_state* s,
     std::string actual_key;
     res = get_actual_key_from_kms(s->cct, key_id, key_selector, actual_key);
     if (res != 0) {
-      ldout(s->cct, 10) << "No encryption key for key-id=" << key_id << dendl;
+      ldout(s->cct, 10) << "ERROR: failed to retrieve actual key from key_id: " << key_id << dendl;
+      s->err.message = "Failed to retrieve the actual key, kms-keyid: " + key_id;
       return res;
     }
     if (actual_key.size() != AES_256_KEYSIZE) {
       ldout(s->cct, 0) << "ERROR: key obtained from key_id:" <<
           key_id << " is not 256 bit size" << dendl;
+      s->err.message = "KMS provided an invalid key for the given kms-keyid.";
       return -ERR_INVALID_ACCESS_KEY;
     }
 
@@ -1292,8 +1374,17 @@ int rgw_s3_prepare_decrypt(struct req_state* s,
   }
 
   if (stored_mode == "RGW-AUTO") {
-    std::string master_encryption_key =
-        from_base64(std::string(s->cct->_conf->rgw_crypt_default_encryption_key));
+    std::string master_encryption_key;
+    try {
+      master_encryption_key = from_base64(std::string(s->cct->_conf->rgw_crypt_default_encryption_key));
+    } catch (...) {
+      ldout(s->cct, 5) << "ERROR: rgw_s3_prepare_decrypt invalid default encryption key "
+                       << "which contains character that is not base64 encoded."
+                       << dendl;
+      s->err.message = "The default encryption key is not valid base64.";
+      return -EINVAL;
+    }
+
     if (master_encryption_key.size() != 256 / 8) {
       ldout(s->cct, 0) << "ERROR: failed to decode 'rgw crypt default encryption key' to 256 bit string" << dendl;
       return -EIO;

@@ -69,6 +69,8 @@ CLUSTER2=cluster2
 POOL=mirror
 PARENT_POOL=mirror_parent
 TEMPDIR=
+USER_ID=mirror
+export CEPH_ARGS="--id ${USER_ID}"
 
 CEPH_ROOT=$(readlink -f $(dirname $0)/../../../src)
 CEPH_BIN=.
@@ -190,8 +192,15 @@ setup()
 
     if [ -z "${RBD_MIRROR_USE_EXISTING_CLUSTER}" ]; then
         cd ${CEPH_ROOT}
-        ${CEPH_SRC}/mstart.sh ${CLUSTER1} -n ${RBD_MIRROR_VARGS}
-        ${CEPH_SRC}/mstart.sh ${CLUSTER2} -n ${RBD_MIRROR_VARGS}
+        CEPH_ARGS='' ${CEPH_SRC}/mstart.sh ${CLUSTER1} -n ${RBD_MIRROR_VARGS}
+        CEPH_ARGS='' ${CEPH_SRC}/mstart.sh ${CLUSTER2} -n ${RBD_MIRROR_VARGS}
+
+        CEPH_ARGS='' ceph --conf run/${CLUSTER1}/ceph.conf \
+            auth get-or-create client.${USER_ID} mon 'profile rbd' osd 'profile rbd' >> \
+            run/${CLUSTER1}/keyring
+        CEPH_ARGS='' ceph --conf run/${CLUSTER2}/ceph.conf \
+            auth get-or-create client.${USER_ID} mon 'profile rbd' osd 'profile rbd' >> \
+            run/${CLUSTER2}/keyring
 
 	rm -f ${TEMPDIR}/${CLUSTER1}.conf
         ln -s $(readlink -f run/${CLUSTER1}/ceph.conf) \
@@ -203,10 +212,15 @@ setup()
         cd ${TEMPDIR}
     fi
 
-    ceph --cluster ${CLUSTER1} osd pool create ${POOL} 64 64
-    ceph --cluster ${CLUSTER1} osd pool create ${PARENT_POOL} 64 64
-    ceph --cluster ${CLUSTER2} osd pool create ${PARENT_POOL} 64 64
-    ceph --cluster ${CLUSTER2} osd pool create ${POOL} 64 64
+    CEPH_ARGS='' ceph --cluster ${CLUSTER1} osd pool create ${POOL} 64 64
+    CEPH_ARGS='' ceph --cluster ${CLUSTER1} osd pool create ${PARENT_POOL} 64 64
+    CEPH_ARGS='' ceph --cluster ${CLUSTER2} osd pool create ${PARENT_POOL} 64 64
+    CEPH_ARGS='' ceph --cluster ${CLUSTER2} osd pool create ${POOL} 64 64
+
+    CEPH_ARGS='' rbd --cluster ${CLUSTER1} pool init ${POOL}
+    CEPH_ARGS='' rbd --cluster ${CLUSTER2} pool init ${POOL}
+    CEPH_ARGS='' rbd --cluster ${CLUSTER1} pool init ${PARENT_POOL}
+    CEPH_ARGS='' rbd --cluster ${CLUSTER2} pool init ${PARENT_POOL}
 
     rbd --cluster ${CLUSTER1} mirror pool enable ${POOL} pool
     rbd --cluster ${CLUSTER2} mirror pool enable ${POOL} pool
@@ -234,13 +248,13 @@ cleanup()
 
     if [ -z "${RBD_MIRROR_USE_EXISTING_CLUSTER}" ]; then
         cd ${CEPH_ROOT}
-        ${CEPH_SRC}/mstop.sh ${CLUSTER1}
-        ${CEPH_SRC}/mstop.sh ${CLUSTER2}
+        CEPH_ARGS='' ${CEPH_SRC}/mstop.sh ${CLUSTER1}
+        CEPH_ARGS='' ${CEPH_SRC}/mstop.sh ${CLUSTER2}
     else
-        ceph --cluster ${CLUSTER1} osd pool rm ${POOL} ${POOL} --yes-i-really-really-mean-it
-        ceph --cluster ${CLUSTER2} osd pool rm ${POOL} ${POOL} --yes-i-really-really-mean-it
-        ceph --cluster ${CLUSTER1} osd pool rm ${PARENT_POOL} ${PARENT_POOL} --yes-i-really-really-mean-it
-        ceph --cluster ${CLUSTER2} osd pool rm ${PARENT_POOL} ${PARENT_POOL} --yes-i-really-really-mean-it
+        CEPH_ARGS='' ceph --cluster ${CLUSTER1} osd pool rm ${POOL} ${POOL} --yes-i-really-really-mean-it
+        CEPH_ARGS='' ceph --cluster ${CLUSTER2} osd pool rm ${POOL} ${POOL} --yes-i-really-really-mean-it
+        CEPH_ARGS='' ceph --cluster ${CLUSTER1} osd pool rm ${PARENT_POOL} ${PARENT_POOL} --yes-i-really-really-mean-it
+        CEPH_ARGS='' ceph --cluster ${CLUSTER2} osd pool rm ${PARENT_POOL} ${PARENT_POOL} --yes-i-really-really-mean-it
     fi
     test "${RBD_MIRROR_TEMDIR}" = "${TEMPDIR}" ||
     rm -Rf ${TEMPDIR}
@@ -257,6 +271,7 @@ start_mirror()
 
     rbd-mirror \
 	--cluster ${cluster} \
+        --id mirror \
 	--pid-file=$(daemon_pid_file "${cluster}:${instance}") \
 	--log-file=${TEMPDIR}/rbd-mirror.${cluster}_daemon.${instance}.log \
 	--admin-socket=${TEMPDIR}/rbd-mirror.${cluster}_daemon.${instance}.\$cluster.asok \
@@ -578,6 +593,27 @@ set_image_meta()
     rbd --cluster ${cluster} -p ${pool} image-meta set ${image} $key $val
 }
 
+compare_image_meta()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local key=$4
+    local value=$5
+
+    test `rbd --cluster ${cluster} -p ${pool} image-meta get ${image} ${key}` = "${value}"
+}
+
+rename_image()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local new_name=$4
+
+    rbd --cluster=${cluster} -p ${pool} rename ${image} ${new_name}
+}
+
 remove_image()
 {
     local cluster=$1
@@ -844,12 +880,22 @@ request_resync_image()
     local cluster=$1
     local pool=$2
     local image=$3
-    local image_id_var_name=$1
+    local image_id_var_name=$4
 
     eval "${image_id_var_name}='$(get_image_id ${cluster} ${pool} ${image})'"
     eval 'test -n "$'${image_id_var_name}'"'
 
     rbd --cluster=${cluster} -p ${pool} mirror image resync ${image}
+}
+
+get_image_data_pool()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster ${cluster} -p ${pool} info ${image} |
+        awk '$1 == "data_pool:" {print $2}'
 }
 
 #

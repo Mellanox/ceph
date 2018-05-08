@@ -68,7 +68,7 @@ public:
     return "";
   }
 
-  sem_t *m_sem;
+  sem_t *m_sem = nullptr;
   rados_t m_cluster;
   rados_ioctx_t m_ioctx;
   std::string m_pool_name;
@@ -131,7 +131,7 @@ public:
     return "";
   }
 
-  sem_t *m_sem;
+  sem_t *m_sem = nullptr;
   Rados m_cluster;
   IoCtx m_ioctx;
   std::string m_pool_name;
@@ -205,6 +205,7 @@ TEST(LibRadosAio, PoolQuotaPP) {
   ASSERT_EQ(0, test_data.m_cluster.pool_create(p.c_str()));
   IoCtx ioctx;
   ASSERT_EQ(0, test_data.m_cluster.ioctx_create(p.c_str(), ioctx));
+  ioctx.application_enable("rados", true);
 
   bufferlist inbl;
   ASSERT_EQ(0, test_data.m_cluster.mon_command(
@@ -2569,7 +2570,7 @@ public:
     return "";
   }
 
-  sem_t *m_sem;
+  sem_t *m_sem = nullptr;
   Rados m_cluster;
   IoCtx m_ioctx;
   std::string m_pool_name;

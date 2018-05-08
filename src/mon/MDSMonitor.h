@@ -34,14 +34,13 @@ class MMDSLoadTargets;
 class MMDSMap;
 class FileSystemCommandHandler;
 
-#define MDS_HEALTH_PREFIX "mds_health"
-
 class MDSMonitor : public PaxosService {
  public:
   MDSMonitor(Monitor *mn, Paxos *p, string service_name);
 
   // service methods
   void create_initial() override;
+  void get_store_prefixes(std::set<string>& s) override;
   void update_from_paxos(bool *need_bootstrap) override;
   void init() override;
   void create_pending() override; 
@@ -90,7 +89,8 @@ class MDSMonitor : public PaxosService {
   void get_health(list<pair<health_status_t,string> >& summary,
 		  list<pair<health_status_t,string> > *detail,
 		  CephContext *cct) const override;
-  int fail_mds(std::ostream &ss, const std::string &arg);
+  int fail_mds(std::ostream &ss, const std::string &arg,
+      MDSMap::mds_info_t *failed_info);
 
   bool preprocess_command(MonOpRequestRef op);
   bool prepare_command(MonOpRequestRef op);
@@ -129,20 +129,24 @@ class MDSMonitor : public PaxosService {
 
   bool maybe_promote_standby(std::shared_ptr<Filesystem> fs);
   bool maybe_expand_cluster(std::shared_ptr<Filesystem> fs);
-  void maybe_replace_gid(mds_gid_t gid, const beacon_info_t &beacon,
+  void maybe_replace_gid(mds_gid_t gid, const MDSMap::mds_info_t& info,
       bool *mds_propose, bool *osd_propose);
   void tick() override;     // check state, take actions
 
   int dump_metadata(const string& who, Formatter *f, ostream& err);
 
-  MDSMap *generate_mds_map(fs_cluster_id_t fscid);
   void update_metadata(mds_gid_t gid, const Metadata& metadata);
   void remove_from_metadata(MonitorDBStore::TransactionRef t);
   int load_metadata(map<mds_gid_t, Metadata>& m);
+  void count_metadata(const string& field, Formatter *f);
+public:
+  void count_metadata(const string& field, map<string,int> *out);
+protected:
 
   // MDS daemon GID to latest health state from that GID
   std::map<uint64_t, MDSHealth> pending_daemon_health;
   std::set<uint64_t> pending_daemon_health_rm;
+
 
   map<mds_gid_t, Metadata> pending_metadata;
 

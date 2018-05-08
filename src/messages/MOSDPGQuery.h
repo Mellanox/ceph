@@ -27,7 +27,7 @@ class MOSDPGQuery : public Message {
   static const int HEAD_VERSION = 4;
   static const int COMPAT_VERSION = 3;
 
-  version_t epoch;
+  version_t epoch = 0;
 
  public:
   version_t get_epoch() const { return epoch; }
@@ -63,7 +63,9 @@ public:
   }
 
   void encode_payload(uint64_t features) override {
-    if (!HAVE_FEATURE(features, SERVER_LUMINOUS)) {
+    if (HAVE_FEATURE(features, SERVER_LUMINOUS)) {
+      header.version = HEAD_VERSION;
+    } else {
       // for kraken/jewel only
       header.version = 3;
       ::encode(epoch, payload);

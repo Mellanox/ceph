@@ -7,6 +7,7 @@
 #include "include/rados/librados.hpp"
 #include "include/rbd_types.h"
 #include "include/Context.h"
+#include "common/zipkin_trace.h"
 
 #include <atomic>
 #include <type_traits>
@@ -95,6 +96,11 @@ struct C_AsyncCallback : public Context {
 } // namespace detail
 
 std::string generate_image_id(librados::IoCtx &ioctx);
+
+template <typename T>
+inline std::string generate_image_id(librados::IoCtx &ioctx) {
+  return generate_image_id(ioctx);
+}
 
 const std::string group_header_name(const std::string &group_id);
 const std::string id_obj_name(const std::string &name);
@@ -192,6 +198,19 @@ bool calc_sparse_extent(const bufferptr &bp,
                         size_t *write_offset,
                         size_t *write_length,
                         size_t *offset);
+
+template <typename I>
+inline ZTracer::Trace create_trace(const I &image_ctx, const char *trace_name,
+				   const ZTracer::Trace &parent_trace) {
+  if (parent_trace.valid()) {
+    return ZTracer::Trace(trace_name, &image_ctx.trace_endpoint, &parent_trace);
+  }
+  return ZTracer::Trace();
+}
+
+bool is_metadata_config_override(const std::string& metadata_key,
+                                 std::string* config_key);
+
 } // namespace util
 
 } // namespace librbd

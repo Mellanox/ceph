@@ -15,11 +15,12 @@
 #ifndef CEPH_LIBRADOS_IOCTXIMPL_H
 #define CEPH_LIBRADOS_IOCTXIMPL_H
 
+#include <atomic>
+
 #include "common/Cond.h"
 #include "common/Mutex.h"
 #include "common/snap_types.h"
 #include "common/zipkin_trace.h"
-#include "include/atomic.h"
 #include "include/types.h"
 #include "include/rados/librados.h"
 #include "include/rados/librados.hpp"
@@ -30,7 +31,7 @@
 class RadosClient;
 
 struct librados::IoCtxImpl {
-  atomic_t ref_cnt;
+  std::atomic<uint64_t> ref_cnt = { 0 };
   RadosClient *client;
   int64_t poolid;
   snapid_t snap_seq;
@@ -69,11 +70,11 @@ struct librados::IoCtxImpl {
   int set_snap_write_context(snapid_t seq, vector<snapid_t>& snaps);
 
   void get() {
-    ref_cnt.inc();
+    ref_cnt++;
   }
 
   void put() {
-    if (ref_cnt.dec() == 0)
+    if (--ref_cnt == 0)
       delete this;
   }
 
@@ -280,6 +281,21 @@ struct librados::IoCtxImpl {
 
   int cache_pin(const object_t& oid);
   int cache_unpin(const object_t& oid);
+
+  int application_enable(const std::string& app_name, bool force);
+  void application_enable_async(const std::string& app_name, bool force,
+                                PoolAsyncCompletionImpl *c);
+  int application_list(std::set<std::string> *app_names);
+  int application_metadata_get(const std::string& app_name,
+                               const std::string &key,
+                               std::string* value);
+  int application_metadata_set(const std::string& app_name,
+                               const std::string &key,
+                               const std::string& value);
+  int application_metadata_remove(const std::string& app_name,
+                                  const std::string &key);
+  int application_metadata_list(const std::string& app_name,
+                                std::map<std::string, std::string> *values);
 
 };
 

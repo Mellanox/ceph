@@ -20,7 +20,7 @@
 #include <set>
 #include <boost/circular_buffer.hpp>
 
-#include "common/Mutex.h"
+#include "common/RWLock.h"
 
 #include "msg/msg_types.h"
 
@@ -29,7 +29,7 @@
 
 
 // Unique reference to a daemon within a cluster
-typedef std::pair<entity_type_t, std::string> DaemonKey;
+typedef std::pair<std::string, std::string> DaemonKey;
 
 // An instance of a performance counter type, within
 // a particular daemon.
@@ -74,18 +74,11 @@ class DaemonPerfCounters
 
   std::map<std::string, PerfCounterInstance> instances;
 
-  // FIXME: this state is really local to DaemonServer, it's part
-  // of the protocol rather than being part of what other classes
-  // mgiht want to read.  Maybe have a separate session object
-  // inside DaemonServer instead of stashing session-ish state here?
-  std::set<std::string> declared_types;
-
   void update(MMgrReport *report);
 
   void clear()
   {
     instances.clear();
-    declared_types.clear();
   }
 };
 
@@ -93,6 +86,8 @@ class DaemonPerfCounters
 class DaemonState
 {
   public:
+  Mutex lock = {"DaemonState::lock"};
+
   DaemonKey key;
 
   // The hostname where daemon was last seen running (extracted
@@ -101,6 +96,15 @@ class DaemonState
 
   // The metadata (hostname, version, etc) sent from the daemon
   std::map<std::string, std::string> metadata;
+
+  // TODO: this can be generalized to other daemons
+  std::vector<OSDHealthMetric> osd_health_metrics;
+
+  // Ephemeral state
+  bool service_daemon = false;
+  utime_t service_status_stamp;
+  std::map<std::string, std::string> service_status;
+  utime_t last_service_beacon;
 
   // The perf counters received in MMgrReport messages
   DaemonPerfCounters perf_counters;
@@ -125,38 +129,52 @@ typedef std::map<DaemonKey, DaemonStatePtr> DaemonStateCollection;
 class DaemonStateIndex
 {
   private:
+  mutable RWLock lock = {"DaemonStateIndex", true, true, true};
+
   std::map<std::string, DaemonStateCollection> by_server;
   DaemonStateCollection all;
-
   std::set<DaemonKey> updating;
 
-  mutable Mutex lock;
+  void _erase(const DaemonKey& dmk);
 
   public:
-
-  DaemonStateIndex() : lock("DaemonState") {}
+  DaemonStateIndex() {}
 
   // FIXME: shouldn't really be public, maybe construct DaemonState
   // objects internally to avoid this.
   PerfCounterTypes types;
 
   void insert(DaemonStatePtr dm);
-  void _erase(DaemonKey dmk);
-
   bool exists(const DaemonKey &key) const;
   DaemonStatePtr get(const DaemonKey &key);
-  DaemonStateCollection get_by_server(const std::string &hostname) const;
-  DaemonStateCollection get_by_type(uint8_t type) const;
 
-  const DaemonStateCollection &get_all() const {return all;}
-  const std::map<std::string, DaemonStateCollection> &get_all_servers() const
-  {
-    return by_server;
+  // Note that these return by value rather than reference to avoid
+  // callers needing to stay in lock while using result.  Callers must
+  // still take the individual DaemonState::lock on each entry though.
+  DaemonStateCollection get_by_server(const std::string &hostname) const;
+  DaemonStateCollection get_by_service(const std::string &svc_name) const;
+  DaemonStateCollection get_all() const {return all;}
+
+  template<typename Callback, typename...Args>
+  auto with_daemons_by_server(Callback&& cb, Args&&... args) const ->
+    decltype(cb(by_server, std::forward<Args>(args)...)) {
+    RWLock::RLocker l(lock);
+    
+    return std::forward<Callback>(cb)(by_server, std::forward<Args>(args)...);
   }
 
-  void notify_updating(const DaemonKey &k) { updating.insert(k); }
-  void clear_updating(const DaemonKey &k) { updating.erase(k); }
-  bool is_updating(const DaemonKey &k) { return updating.count(k) > 0; }
+  void notify_updating(const DaemonKey &k) {
+    RWLock::WLocker l(lock);
+    updating.insert(k);
+  }
+  void clear_updating(const DaemonKey &k) {
+    RWLock::WLocker l(lock);
+    updating.erase(k);
+  }
+  bool is_updating(const DaemonKey &k) {
+    RWLock::RLocker l(lock);
+    return updating.count(k) > 0;
+  }
 
   /**
    * Remove state for all daemons of this type whose names are
@@ -164,7 +182,8 @@ class DaemonStateIndex
    * a cluster map and want to ensure that anything absent in the map
    * is also absent in this class.
    */
-  void cull(entity_type_t daemon_type, std::set<std::string> names_exist);
+  void cull(const std::string& svc_name,
+	    const std::set<std::string>& names_exist);
 };
 
 #endif

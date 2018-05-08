@@ -14,6 +14,7 @@
 
 #include <sstream>
 #include <boost/utility.hpp>
+#include <boost/regex.hpp>
 
 #include "MDSMonitor.h"
 #include "FSCommands.h"
@@ -48,30 +49,31 @@ static ostream& _prefix(std::ostream *_dout, Monitor *mon, FSMap const& fsmap) {
 		<< ").mds e" << fsmap.get_epoch() << " ";
 }
 
+static const string MDS_METADATA_PREFIX("mds_metadata");
+static const string MDS_HEALTH_PREFIX("mds_health");
+
+
 /*
  * Specialized implementation of cmd_getval to allow us to parse
  * out strongly-typedef'd types
  */
 template<> bool cmd_getval(CephContext *cct, const cmdmap_t& cmdmap,
-                std::string k, mds_gid_t &val)
+			   const std::string& k, mds_gid_t &val)
 {
   return cmd_getval(cct, cmdmap, k, (int64_t&)val);
 }
 
 template<> bool cmd_getval(CephContext *cct, const cmdmap_t& cmdmap,
-                std::string k, mds_rank_t &val)
+			   const std::string& k, mds_rank_t &val)
 {
   return cmd_getval(cct, cmdmap, k, (int64_t&)val);
 }
 
 template<> bool cmd_getval(CephContext *cct, const cmdmap_t& cmdmap,
-                std::string k, MDSMap::DaemonState &val)
+			   const std::string& k, MDSMap::DaemonState &val)
 {
   return cmd_getval(cct, cmdmap, k, (int64_t&)val);
 }
-
-static const string MDS_METADATA_PREFIX("mds_metadata");
-
 
 // my methods
 
@@ -88,6 +90,12 @@ void MDSMonitor::create_initial()
   dout(10) << "create_initial" << dendl;
 }
 
+void MDSMonitor::get_store_prefixes(std::set<string>& s)
+{
+  s.insert(service_name);
+  s.insert(MDS_METADATA_PREFIX);
+  s.insert(MDS_HEALTH_PREFIX);
+}
 
 void MDSMonitor::update_from_paxos(bool *need_bootstrap)
 {
@@ -98,6 +106,8 @@ void MDSMonitor::update_from_paxos(bool *need_bootstrap)
   dout(10) << __func__ << " version " << version
 	   << ", my e " << fsmap.epoch << dendl;
   assert(version > fsmap.epoch);
+
+  load_health();
 
   // read and decode
   bufferlist fsmap_bl;
@@ -129,6 +139,11 @@ void MDSMonitor::create_pending()
 {
   pending_fsmap = fsmap;
   pending_fsmap.epoch++;
+
+  if (mon->osdmon()->is_readable()) {
+    auto &osdmap = mon->osdmon()->osdmap;
+    pending_fsmap.sanitize([&osdmap](int64_t pool){return osdmap.have_pg_pool(pool);});
+  }
 
   dout(10) << "create_pending e" << pending_fsmap.epoch << dendl;
 }
@@ -174,6 +189,69 @@ void MDSMonitor::encode_pending(MonitorDBStore::TransactionRef t)
   }
   pending_daemon_health_rm.clear();
   remove_from_metadata(t);
+
+  // health
+  health_check_map_t new_checks;
+  const auto info_map = pending_fsmap.get_mds_info();
+  for (const auto &i : info_map) {
+    const auto &gid = i.first;
+    const auto &info = i.second;
+    if (pending_daemon_health_rm.count(gid)) {
+      continue;
+    }
+    MDSHealth health;
+    auto p = pending_daemon_health.find(gid);
+    if (p != pending_daemon_health.end()) {
+      health = p->second;
+    } else {
+      bufferlist bl;
+      mon->store->get(MDS_HEALTH_PREFIX, stringify(gid), bl);
+      if (!bl.length()) {
+	derr << "Missing health data for MDS " << gid << dendl;
+	continue;
+      }
+      bufferlist::iterator bl_i = bl.begin();
+      health.decode(bl_i);
+    }
+    for (const auto &metric : health.metrics) {
+      const int rank = info.rank;
+      health_check_t *check = &new_checks.get_or_add(
+	mds_metric_name(metric.type),
+	metric.sev,
+	mds_metric_summary(metric.type));
+      ostringstream ss;
+      ss << "mds" << info.name << "(mds." << rank << "): " << metric.message;
+      for (auto p = metric.metadata.begin();
+	   p != metric.metadata.end();
+	   ++p) {
+	if (p != metric.metadata.begin()) {
+	  ss << ", ";
+	}
+	ss << p->first << ": " << p->second;
+      }
+      check->detail.push_back(ss.str());
+    }
+  }
+  pending_fsmap.get_health_checks(&new_checks);
+  for (auto& p : new_checks.checks) {
+    p.second.summary = boost::regex_replace(
+      p.second.summary,
+      boost::regex("%num%"),
+      stringify(p.second.detail.size()));
+    p.second.summary = boost::regex_replace(
+      p.second.summary,
+      boost::regex("%plurals%"),
+      p.second.detail.size() > 1 ? "s" : "");
+    p.second.summary = boost::regex_replace(
+      p.second.summary,
+      boost::regex("%isorare%"),
+      p.second.detail.size() > 1 ? "are" : "is");
+    p.second.summary = boost::regex_replace(
+      p.second.summary,
+      boost::regex("%hasorhave%"),
+      p.second.detail.size() > 1 ? "have" : "has");
+  }
+  encode_health(new_checks, t);
 }
 
 version_t MDSMonitor::get_trim_to()
@@ -503,6 +581,9 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
           mon->osdmon()->wait_for_writeable(op, new C_RetryMessage(this, op));
           return false;
         }
+        const MDSMap::mds_info_t &existing_info =
+          pending_fsmap.get_info_gid(existing);
+        mon->clog->info() << existing_info.human_name() << " restarted";
 	fail_mds_gid(existing);
         failed_mds = true;
       }
@@ -536,9 +617,8 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
       if (leaderinfo && (leaderinfo->rank >= 0)) {
         auto fscid = pending_fsmap.mds_roles.at(leaderinfo->global_id);
         auto fs = pending_fsmap.get_filesystem(fscid);
-        bool followable = fs->mds_map.is_followable(leaderinfo->rank);
 
-        pending_fsmap.modify_daemon(gid, [fscid, leaderinfo, followable](
+        pending_fsmap.modify_daemon(gid, [fscid, leaderinfo](
               MDSMap::mds_info_t *info) {
             info->standby_for_rank = leaderinfo->rank;
             info->standby_for_fscid = fscid;
@@ -596,6 +676,14 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
 	     << "  standby_for_rank=" << m->get_standby_for_rank()
 	     << dendl;
     if (state == MDSMap::STATE_STOPPED) {
+      const auto fscid = pending_fsmap.mds_roles.at(gid);
+      auto fs = pending_fsmap.get_filesystem(fscid);
+
+      mon->clog->info() << info.human_name() << " finished "
+                        << "deactivating rank " << info.rank << " in filesystem "
+                        << fs->mds_map.fs_name << " (now has "
+                        << fs->mds_map.get_num_in_mds() - 1 << " ranks)";
+
       auto erased = pending_fsmap.stop(gid);
       erased.push_back(gid);
 
@@ -606,6 +694,8 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
           pending_daemon_health_rm.insert(erased_gid);
         }
       }
+
+
     } else if (state == MDSMap::STATE_DAMAGED) {
       if (!mon->osdmon()->is_writeable()) {
         dout(4) << __func__ << ": DAMAGED from rank " << info.rank
@@ -620,7 +710,7 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
               << info.rank << " damaged" << dendl;
 
       utime_t until = ceph_clock_now();
-      until += g_conf->mds_blacklist_interval;
+      until += g_conf->get_val<double>("mon_mds_blacklist_interval");
       const auto blacklist_epoch = mon->osdmon()->blacklist(info.addr, until);
       request_proposal(mon->osdmon());
       pending_fsmap.damaged(gid, blacklist_epoch);
@@ -665,6 +755,14 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
            << ceph_mds_state_name(state) << dendl;
       return true;
     } else {
+      if (info.state != MDSMap::STATE_ACTIVE && state == MDSMap::STATE_ACTIVE) {
+        auto fscid = pending_fsmap.mds_roles.at(gid);
+        auto fs = pending_fsmap.get_filesystem(fscid);
+        mon->clog->info() << info.human_name() << " is now active in "
+                          << "filesystem " << fs->mds_map.fs_name << " as rank "
+                          << info.rank;
+      }
+
       // Made it through special cases and validations, record the
       // daemon's reported state to the FSMap.
       pending_fsmap.modify_daemon(gid, [state, seq](MDSMap::mds_info_t *info) {
@@ -715,7 +813,7 @@ void MDSMonitor::_updated(MonOpRequestRef op)
   op->mark_mdsmon_event(__func__);
   MMDSBeacon *m = static_cast<MMDSBeacon*>(op->get_req());
   dout(10) << "_updated " << m->get_orig_source() << " " << *m << dendl;
-  mon->clog->info() << m->get_orig_source_inst() << " "
+  mon->clog->debug() << m->get_orig_source_inst() << " "
 	  << ceph_mds_state_name(m->get_state());
 
   if (m->get_state() == MDSMap::STATE_STOPPED) {
@@ -740,8 +838,9 @@ void MDSMonitor::on_active()
   tick();
   update_logger();
 
-  if (mon->is_leader())
-    mon->clog->info() << "fsmap " << fsmap;
+  if (mon->is_leader()) {
+    mon->clog->debug() << "fsmap " << fsmap;
+  }
 }
 
 void MDSMonitor::get_health(list<pair<health_status_t, string> >& summary,
@@ -768,7 +867,7 @@ void MDSMonitor::get_health(list<pair<health_status_t, string> >& summary,
     health.decode(bl_i);
 
     for (const auto &metric : health.metrics) {
-      int const rank = info.rank;
+      const int rank = info.rank;
       std::ostringstream message;
       message << "mds" << rank << ": " << metric.message;
       summary.push_back(std::make_pair(metric.sev, message.str()));
@@ -882,11 +981,11 @@ bool MDSMonitor::preprocess_command(MonOpRequestRef op)
       } else {
 	mdsmap->print(ds);
 	r = 0;
-      } 
-      if (r == 0) {
-	rdata.append(ds);
-	ss << "dumped fsmap epoch " << p->get_epoch();
       }
+
+      rdata.append(ds);
+      ss << "dumped fsmap epoch " << p->get_epoch();
+
       if (p != &fsmap) {
 	delete p;
       }
@@ -921,11 +1020,11 @@ bool MDSMonitor::preprocess_command(MonOpRequestRef op)
       } else {
 	p->print(ds);
 	r = 0;
-      } 
-      if (r == 0) {
-	rdata.append(ds);
-	ss << "dumped fsmap epoch " << p->get_epoch();
       }
+
+      rdata.append(ds);
+      ss << "dumped fsmap epoch " << p->get_epoch();
+
       if (p != &fsmap)
 	delete p;
     }
@@ -957,6 +1056,7 @@ bool MDSMonitor::preprocess_command(MonOpRequestRef op)
           derr << "Unexpected error reading metadata: " << cpp_strerror(r)
                << dendl;
           ss << get_err.str();
+          f->close_section();
           break;
         }
         f->close_section();
@@ -969,6 +1069,20 @@ bool MDSMonitor::preprocess_command(MonOpRequestRef op)
       f->close_section();
     }
     f->flush(ds);
+  } else if (prefix == "mds versions") {
+    if (!f)
+      f.reset(Formatter::create("json-pretty"));
+    count_metadata("ceph_version", f.get());
+    f->flush(ds);
+    r = 0;
+  } else if (prefix == "mds count-metadata") {
+    if (!f)
+      f.reset(Formatter::create("json-pretty"));
+    string field;
+    cmd_getval(g_ceph_context, cmdmap, "property", field);
+    count_metadata(field, f.get());
+    f->flush(ds);
+    r = 0;
   } else if (prefix == "mds getmap") {
     epoch_t e;
     int64_t epocharg;
@@ -1071,9 +1185,8 @@ bool MDSMonitor::preprocess_command(MonOpRequestRef op)
         
         ds << "name: " << mds_map.fs_name << ", metadata pool: "
            << md_pool_name << ", data pools: [";
-        for (std::set<int64_t>::iterator dpi = mds_map.data_pools.begin();
-           dpi != mds_map.data_pools.end(); ++dpi) {
-          const string &pool_name = mon->osdmon()->osdmap.get_pool_name(*dpi);
+        for (auto dpi : mds_map.data_pools) {
+          const string &pool_name = mon->osdmon()->osdmap.get_pool_name(dpi);
           ds << pool_name << " ";
         }
         ds << "]" << std::endl;
@@ -1104,7 +1217,7 @@ bool MDSMonitor::fail_mds_gid(mds_gid_t gid)
   epoch_t blacklist_epoch = 0;
   if (info.rank >= 0 && info.state != MDSMap::STATE_STANDBY_REPLAY) {
     utime_t until = ceph_clock_now();
-    until += g_conf->mds_blacklist_interval;
+    until += g_conf->get_val<double>("mon_mds_blacklist_interval");
     blacklist_epoch = mon->osdmon()->blacklist(info.addr, until);
   }
 
@@ -1120,13 +1233,15 @@ bool MDSMonitor::fail_mds_gid(mds_gid_t gid)
 
 mds_gid_t MDSMonitor::gid_from_arg(const std::string& arg, std::ostream &ss)
 {
+  const FSMap *relevant_fsmap = mon->is_leader() ? &pending_fsmap : &fsmap;
+
   // Try parsing as a role
   mds_role_t role;
   std::ostringstream ignore_err;  // Don't spam 'ss' with parse_role errors
   int r = parse_role(arg, &role, ignore_err);
   if (r == 0) {
     // See if a GID is assigned to this role
-    auto fs = pending_fsmap.get_filesystem(role.fscid);
+    auto fs = relevant_fsmap->get_filesystem(role.fscid);
     assert(fs != nullptr);  // parse_role ensures it exists
     if (fs->mds_map.is_up(role.rank)) {
       dout(10) << __func__ << ": validated rank/GID " << role
@@ -1140,7 +1255,7 @@ mds_gid_t MDSMonitor::gid_from_arg(const std::string& arg, std::ostream &ss)
   unsigned long long maybe_gid = strict_strtoll(arg.c_str(), 10, &err);
   if (!err.empty()) {
     // Not a role or a GID, try as a daemon name
-    const MDSMap::mds_info_t *mds_info = fsmap.find_by_name(arg);
+    const MDSMap::mds_info_t *mds_info = relevant_fsmap->find_by_name(arg);
     if (!mds_info) {
       ss << "MDS named '" << arg
 	 << "' does not exist, or is not up";
@@ -1153,14 +1268,9 @@ mds_gid_t MDSMonitor::gid_from_arg(const std::string& arg, std::ostream &ss)
     // Not a role, but parses as a an integer, might be a GID
     dout(10) << __func__ << ": treating MDS reference '" << arg
 	     << "' as an integer " << maybe_gid << dendl;
-    if (mon->is_leader()) {
-      if (pending_fsmap.gid_exists(mds_gid_t(maybe_gid))) {
-        return mds_gid_t(maybe_gid);
-      }
-    } else {
-      if (fsmap.gid_exists(mds_gid_t(maybe_gid))) {
-        return mds_gid_t(maybe_gid);
-      }
+
+    if (relevant_fsmap->gid_exists(mds_gid_t(maybe_gid))) {
+      return mds_gid_t(maybe_gid);
     }
   }
 
@@ -1169,8 +1279,11 @@ mds_gid_t MDSMonitor::gid_from_arg(const std::string& arg, std::ostream &ss)
   return MDS_GID_NONE;
 }
 
-int MDSMonitor::fail_mds(std::ostream &ss, const std::string &arg)
+int MDSMonitor::fail_mds(std::ostream &ss, const std::string &arg,
+    MDSMap::mds_info_t *failed_info)
 {
+  assert(failed_info != nullptr);
+
   mds_gid_t gid = gid_from_arg(arg, ss);
   if (gid == MDS_GID_NONE) {
     return 0;
@@ -1178,6 +1291,11 @@ int MDSMonitor::fail_mds(std::ostream &ss, const std::string &arg)
   if (!mon->osdmon()->is_writeable()) {
     return -EAGAIN;
   }
+
+  // Take a copy of the info before removing the MDS from the map,
+  // so that the caller knows which mds (if any) they ended up removing.
+  *failed_info = pending_fsmap.get_info_gid(gid);
+
   fail_mds_gid(gid);
   ss << "failed mds gid " << gid;
   assert(mon->osdmon()->is_writeable());
@@ -1210,9 +1328,18 @@ bool MDSMonitor::prepare_command(MonOpRequestRef op)
     return true;
   }
 
+  bool batched_propose = false;
   for (auto h : handlers) {
     if (h->can_handle(prefix)) {
+      batched_propose = h->batched_propose();
+      if (batched_propose) {
+        paxos->plug();
+      }
       r = h->handle(mon, pending_fsmap, op, cmdmap, ss);
+      if (batched_propose) {
+        paxos->unplug();
+      }
+
       if (r == -EAGAIN) {
         // message has been enqueued for retry; return.
         dout(4) << __func__ << " enqueue for retry by prepare_command" << dendl;
@@ -1266,6 +1393,9 @@ out:
     // success.. delay reply
     wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, r, rs,
 					      get_last_committed() + 1));
+    if (batched_propose) {
+      force_immediate_propose();
+    }
     return true;
   } else {
     // reply immediately
@@ -1328,6 +1458,10 @@ int MDSMonitor::filesystem_command(
       ss << "can't tell the root (" << fs->mds_map.get_root()
 	 << ") or tableserver (" << fs->mds_map.get_tableserver()
 	 << ") to deactivate";
+    } else if (role.rank != fs->mds_map.get_last_in_mds()) {
+      r = -EINVAL;
+      ss << "mds." << role << " doesn't have the max rank ("
+	 << fs->mds_map.get_last_in_mds() << ")";
     } else if (fs->mds_map.get_num_in_mds() <= size_t(fs->mds_map.get_max_mds())) {
       r = -EBUSY;
       ss << "must decrease max_mds or else MDS will immediately reactivate";
@@ -1365,10 +1499,18 @@ int MDSMonitor::filesystem_command(
   } else if (prefix == "mds fail") {
     string who;
     cmd_getval(g_ceph_context, cmdmap, "who", who);
-    r = fail_mds(ss, who);
+
+    MDSMap::mds_info_t failed_info;
+    r = fail_mds(ss, who, &failed_info);
     if (r < 0 && r == -EAGAIN) {
       mon->osdmon()->wait_for_writeable(op, new C_RetryMessage(this, op));
       return -EAGAIN; // don't propose yet; wait for message to be retried
+    } else if (r == 0) {
+      // Only log if we really did something (not when was already gone)
+      if (failed_info.global_id != MDS_GID_NONE) {
+        mon->clog->info() << failed_info.human_name() << " marked failed by "
+                          << op->get_session()->entity_name;
+      }
     }
   } else if (prefix == "mds rm") {
     mds_gid_t gid;
@@ -1774,6 +1916,31 @@ int MDSMonitor::load_metadata(map<mds_gid_t, Metadata>& m)
   return 0;
 }
 
+void MDSMonitor::count_metadata(const string& field, map<string,int> *out)
+{
+  map<mds_gid_t,Metadata> meta;
+  load_metadata(meta);
+  for (auto& p : meta) {
+    auto q = p.second.find(field);
+    if (q == p.second.end()) {
+      (*out)["unknown"]++;
+    } else {
+      (*out)[q->second]++;
+    }
+  }
+}
+
+void MDSMonitor::count_metadata(const string& field, Formatter *f)
+{
+  map<string,int> by_val;
+  count_metadata(field, &by_val);
+  f->open_object_section(field.c_str());
+  for (auto& p : by_val) {
+    f->dump_int(p.first.c_str(), p.second);
+  }
+  f->close_section();
+}
+
 int MDSMonitor::dump_metadata(const std::string &who, Formatter *f, ostream& err)
 {
   assert(f);
@@ -1856,8 +2023,14 @@ bool MDSMonitor::maybe_expand_cluster(std::shared_ptr<Filesystem> fs)
       break;
     }
 
-    dout(1) << "adding standby " << pending_fsmap.get_info_gid(newgid).addr
+    const auto &new_info = pending_fsmap.get_info_gid(newgid);
+    dout(1) << "assigned standby " << new_info.addr
             << " as mds." << mds << dendl;
+
+    mon->clog->info() << new_info.human_name() << " assigned to "
+                         "filesystem " << fs->mds_map.fs_name << " as rank "
+                      << mds << " (now has " << fs->mds_map.get_num_in_mds() + 1
+                      << " ranks)";
     pending_fsmap.promote(newgid, fs, mds);
     do_propose = true;
   }
@@ -1871,20 +2044,24 @@ bool MDSMonitor::maybe_expand_cluster(std::shared_ptr<Filesystem> fs)
  * is available, fail this daemon (remove from map) and pass its
  * role to another daemon.
  */
-void MDSMonitor::maybe_replace_gid(mds_gid_t gid,
-    const beacon_info_t &beacon,
+void MDSMonitor::maybe_replace_gid(mds_gid_t gid, const MDSMap::mds_info_t& info,
     bool *mds_propose, bool *osd_propose)
 {
   assert(mds_propose != nullptr);
   assert(osd_propose != nullptr);
 
-  const MDSMap::mds_info_t info = pending_fsmap.get_info_gid(gid);
   const auto fscid = pending_fsmap.mds_roles.at(gid);
 
-  dout(10) << "no beacon from " << gid << " " << info.addr << " mds."
-    << info.rank << "." << info.inc
-    << " " << ceph_mds_state_name(info.state)
-    << " since " << beacon.stamp << dendl;
+  // We will only take decisive action (replacing/removing a daemon)
+  // if we have some indicating that some other daemon(s) are successfully
+  // getting beacons through recently.
+  utime_t latest_beacon;
+  for (const auto & i : last_beacon) {
+    latest_beacon = MAX(i.second.stamp, latest_beacon);
+  }
+  const bool may_replace = latest_beacon >
+    (ceph_clock_now() -
+     MAX(g_conf->mds_beacon_interval, g_conf->mds_beacon_grace * 0.5));
 
   // are we in?
   // and is there a non-laggy standby that can take over for us?
@@ -1892,6 +2069,7 @@ void MDSMonitor::maybe_replace_gid(mds_gid_t gid,
   if (info.rank >= 0 &&
       info.state != MDSMap::STATE_STANDBY &&
       info.state != MDSMap::STATE_STANDBY_REPLAY &&
+      may_replace &&
       !pending_fsmap.get_filesystem(fscid)->mds_map.test_flag(CEPH_MDSMAP_DOWN) &&
       (sgid = pending_fsmap.find_replacement_for({fscid, info.rank}, info.name,
                 g_conf->mon_force_standby_active)) != MDS_GID_NONE)
@@ -1902,6 +2080,11 @@ void MDSMonitor::maybe_replace_gid(mds_gid_t gid,
       << info.rank << "." << info.inc
       << " " << ceph_mds_state_name(info.state)
       << " with " << sgid << "/" << si.name << " " << si.addr << dendl;
+
+    mon->clog->warn() << info.human_name() 
+                      << " is not responding, replacing it "
+                      << "as rank " << info.rank
+                      << " with standby " << si.human_name();
 
     // Remember what NS the old one was in
     const fs_cluster_id_t fscid = pending_fsmap.mds_roles.at(gid);
@@ -1914,11 +2097,13 @@ void MDSMonitor::maybe_replace_gid(mds_gid_t gid,
     pending_fsmap.promote(sgid, fs, info.rank);
 
     *mds_propose = true;
-  } else if (info.state == MDSMap::STATE_STANDBY_REPLAY || 
-             info.state == MDSMap::STATE_STANDBY) {
+  } else if ((info.state == MDSMap::STATE_STANDBY_REPLAY ||
+             info.state == MDSMap::STATE_STANDBY) && may_replace) {
     dout(10) << " failing and removing " << gid << " " << info.addr << " mds." << info.rank 
       << "." << info.inc << " " << ceph_mds_state_name(info.state)
       << dendl;
+    mon->clog->info() << "Standby " << info.human_name() << " is not "
+                         "responding, dropping it";
     fail_mds_gid(gid);
     *mds_propose = true;
   } else if (!info.laggy()) {
@@ -1951,6 +2136,10 @@ bool MDSMonitor::maybe_promote_standby(std::shared_ptr<Filesystem> fs)
         const MDSMap::mds_info_t si = pending_fsmap.get_info_gid(sgid);
         dout(0) << " taking over failed mds." << f << " with " << sgid
                 << "/" << si.name << " " << si.addr << dendl;
+        mon->clog->info() << "Standby " << si.human_name()
+                          << " assigned to filesystem " << fs->mds_map.fs_name
+                          << " as rank " << f;
+
         pending_fsmap.promote(sgid, fs, f);
 	do_propose = true;
       }
@@ -2089,31 +2278,35 @@ void MDSMonitor::tick()
     }
   }
 
-  // If the OSDMap is writeable, we can blacklist things, so we can
-  // try failing any laggy MDS daemons.  Consider each one for failure.
-  if (mon->osdmon()->is_writeable()) {
-    bool propose_osdmap = false;
+  bool propose_osdmap = false;
+  bool osdmap_writeable = mon->osdmon()->is_writeable();
+  auto p = last_beacon.begin();
+  while (p != last_beacon.end()) {
+    mds_gid_t gid = p->first;
+    auto beacon_info = p->second;
+    ++p;
 
-    map<mds_gid_t, beacon_info_t>::iterator p = last_beacon.begin();
-    while (p != last_beacon.end()) {
-      mds_gid_t gid = p->first;
-      auto beacon_info = p->second;
-      ++p;
-
-      if (!pending_fsmap.gid_exists(gid)) {
-	// clean it out
-	last_beacon.erase(gid);
-	continue;
-      }
-
-      if (beacon_info.stamp < cutoff) {
-        maybe_replace_gid(gid, beacon_info, &do_propose, &propose_osdmap);
-      }
+    if (!pending_fsmap.gid_exists(gid)) {
+      // clean it out
+      last_beacon.erase(gid);
+      continue;
     }
 
-    if (propose_osdmap) {
-      request_proposal(mon->osdmon());
+    if (beacon_info.stamp < cutoff) {
+      auto &info = pending_fsmap.get_info_gid(gid);
+      dout(1) << "no beacon from mds." << info.rank << "." << info.inc
+              << " (gid: " << gid << " addr: " << info.addr
+              << " state: " << ceph_mds_state_name(info.state) << ")"
+              << " since " << beacon_info.stamp << dendl;
+      // If the OSDMap is writeable, we can blacklist things, so we can
+      // try failing any laggy MDS daemons.  Consider each one for failure.
+      if (osdmap_writeable) {
+        maybe_replace_gid(gid, info, &do_propose, &propose_osdmap);
+      }
     }
+  }
+  if (propose_osdmap) {
+    request_proposal(mon->osdmon());
   }
 
   for (auto i : pending_fsmap.filesystems) {
@@ -2153,7 +2346,7 @@ bool MDSMonitor::try_standby_replay(
 MDSMonitor::MDSMonitor(Monitor *mn, Paxos *p, string service_name)
   : PaxosService(mn, p, service_name)
 {
-  handlers = FileSystemCommandHandler::load();
+  handlers = FileSystemCommandHandler::load(p);
 }
 
 void MDSMonitor::on_restart()
