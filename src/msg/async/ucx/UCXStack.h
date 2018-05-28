@@ -20,6 +20,7 @@
 #include <vector>
 #include <thread>
 #include <deque>
+#include <queue>
 
 #include "common/ceph_context.h"
 #include "common/debug.h"
@@ -54,21 +55,29 @@ public:
     virtual void initialize() override;
     virtual void destroy() override;
 
-    int conn_establish(int fd);
+    int conn_establish(int fd, ucp_ep_h ep);
 
     void set_stack(UCXStack *s);
     UCXStack *get_stack() { return stack; }
+    ucp_worker_h get_ucp_worker() const {
+        return driver->get_ucp_worker();
+    }
+    int get_ucp_fd() const {
+        return driver->get_ucp_fd();
+    }
 };
 
 class UCXConnectedSocketImpl : public ConnectedSocketImpl {
 private:
     UCXWorker *worker;
-
-    int tcp_fd;
+    ucp_ep_address_t *ucp_ep_addr;
+    ucp_ep_h          ucp_ep;
+//    static int _global_fd_counter = 0;
+    int my_fd;
     CephContext *cct() { return worker->cct; }
 
 public:
-    UCXConnectedSocketImpl(UCXWorker *w);
+    UCXConnectedSocketImpl(UCXWorker *w, ucp_ep_address_t *ep_addr = NULL);
     virtual ~UCXConnectedSocketImpl();
 
     int connect(const entity_addr_t& peer_addr, const SocketOptions &opt);
@@ -81,7 +90,7 @@ public:
     virtual ssize_t send(bufferlist &bl, bool more) override;
     virtual void shutdown() override;
     virtual void close() override;
-    virtual int fd() const override { return tcp_fd; }
+    virtual int fd() const override { return my_fd; }
 
     //ucp request magic
     static void request_init(void *req);
@@ -91,9 +100,16 @@ public:
 class UCXServerSocketImpl : public ServerSocketImpl {
 private:
     UCXWorker *worker;
-    int server_setup_socket = -1;
+    ucp_listener_h ucp_listener = NULL;
+    int my_fd;
 
     CephContext *cct() { return worker->cct; }
+    static void server_accept_cb(ucp_ep_address_t *ep_addr, void *self) {
+        UCXServerSocketImpl *server =
+                                reinterpret_cast<UCXServerSocketImpl *>(self);
+        UCXDriver *driver = dynamic_cast<UCXDriver *>(server->worker->center.get_driver());
+        driver->conn_enqueue(server->my_fd, ep_addr);
+    }
 public:
     UCXServerSocketImpl(UCXWorker *w);
     ~UCXServerSocketImpl();
@@ -101,10 +117,13 @@ public:
     int listen(entity_addr_t &sa, const SocketOptions &opt);
 
     // interface functions
-    virtual int accept(ConnectedSocket *sock, const SocketOptions &opt, entity_addr_t *out, Worker *w) override;
+    virtual int accept(ConnectedSocket *sock, const SocketOptions &opt,
+                       entity_addr_t *out, Worker *w) override;
     virtual void abort_accept() override;
     // Get file descriptor
-    virtual int fd() const override { return server_setup_socket; }
+    virtual int fd() const override {
+        return my_fd;
+    }
 };
 
 class UCXStack : public NetworkStack {
@@ -121,5 +140,86 @@ public:
 
     ucp_context_h get_ucp_context() { return ucp_context; }
 };
+
+class UCXGlobals {
+    static const int        fd_max         = std::numeric_limits<int16_t>::max() * 2;
+    int                     fd_cntr        = std::numeric_limits<int16_t>::max();
+    int                     fd_server_cntr = fd_max;
+
+    mutable std::mutex      lock;
+
+    std::map<int, ucp_ep_h>             fd2ep_map;
+    std::map<int, int>                  fd2ucxfd_map;
+    std::map<int, UCXServerSocketImpl*> fd2ss;
+    std::map<UCXServerSocketImpl*, int> ss2fd;
+public:
+    static bool is_server_fd(int fd) {
+        return fd > fd_max;
+    }
+
+    UCXServerSocketImpl *get_ss(int fd) const {
+        UCXServerSocketImpl *ss = NULL;
+        lock.lock();
+        std::map<int, UCXServerSocketImpl*>::const_iterator i = fd2ss.find(fd);
+        if (i != fd2ss.end()) {
+            ss = i->second;
+        }
+        lock.unlock();
+        return ss;
+    }
+
+    int get_ucx_fd(int fd) const {
+        int ucx_fd = 0;
+        lock.lock();
+        std::map<int, int>::const_iterator i = fd2ucxfd_map.find(fd);
+        if (i != fd2ucxfd_map.end()) {
+            ucx_fd = i->second;
+        }
+        lock.unlock();
+        return ucx_fd;
+    }
+
+    int get_fd(const ucp_ep_h ep, int ucp_fd) {
+        lock.lock();
+        int fd = ++fd_cntr;
+        assert(fd_cntr < fd_max);
+        assert(fd2ep_map.count(fd) == 0);
+        fd2ep_map[fd]    = ep;
+        fd2ucxfd_map[fd] = ucp_fd;
+        lock.unlock();
+        return fd;
+    }
+
+    int get_fd(UCXServerSocketImpl *ss) {
+        lock.lock();
+        int fd = ++fd_server_cntr;
+        assert(fd_server_cntr > fd_max);
+        assert(fd2ss.count(fd) == 0);
+        fd2ss[fd] = ss;
+        ss2fd[ss] = fd;
+        lock.unlock();
+        return fd;
+    }
+
+    void release_fd(int fd) {
+        lock.lock();
+        if (fd > fd_max) {
+            ss2fd.erase(fd2ss[fd]);
+            fd2ss.erase(fd);
+        } else {
+            assert(fd2ep_map.count(fd) > 0);
+            fd2ep_map.erase(fd);
+            fd2ucxfd_map.erase(fd);
+        }
+        lock.unlock();
+    }
+
+    void release_ss(UCXServerSocketImpl *ss) {
+        fd2ss.erase(ss2fd[ss]);
+        ss2fd.erase(ss);
+    }
+
+};
+
 
 #endif

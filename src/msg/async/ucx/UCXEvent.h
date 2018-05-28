@@ -2,6 +2,7 @@
 #define CEPH_UCXEVENT_H
 
 #include <vector>
+#include <queue>
 
 #include "msg/async/Stack.h"
 #include "msg/async/Event.h"
@@ -48,7 +49,9 @@ class UCXDriver : public EpollDriver {
 
         Mutex lock; /* Protects 'connecting' pool */
 
-        std::set<int> connecting;
+        std::set<int> connecting; /* TODO: remove */
+        /* server fd + ep address */
+        std::list<std::pair<int, ucp_ep_address_t *> > conn_queue;
         std::set<int> waiting_events;
 
         std::set<int> undelivered;
@@ -68,7 +71,7 @@ class UCXDriver : public EpollDriver {
                       ucp_address_t *ucp_addr,
                       size_t ucp_addr_len);
 
-        int conn_create(int fd);
+        int conn_create(int fd, ucp_ep_h ep);
         int recv_stream(int fd);
 
         void conn_release_recvs(int fd);
@@ -90,16 +93,24 @@ class UCXDriver : public EpollDriver {
                          ucp_address_t **ucp_addr,
                          size_t *ucp_addr_len);
 
-        int conn_establish(int fd,
-                           ucp_address_t *ucp_addr,
-                           size_t ucp_addr_len);
+        int conn_establish(int fd, ucp_ep_h ep);
+
+        void conn_enqueue(int fd, ucp_ep_address_t *ep_addr);
+        bool has_conn_reqs() const {
+            return !conn_queue.empty();
+        }
+        std::pair<int, ucp_ep_address_t*> conn_dequeue(int fd);
+        int get_first_conn_fd() const {
+//            ucs_assert(has_conn_reqs());
+            return conn_queue.front().first;
+        }
 
         void conn_close(int fd);
         void conn_shutdown(int fd);
 
         int is_connected(int fd) {
             return (connections.count(fd) > 0 &&
-                        NULL != connections[fd].ucp_ep);
+                    NULL != connections[fd].ucp_ep);
         }
 
         ssize_t send(int fd, bufferlist &bl, bool more);
@@ -113,6 +124,12 @@ class UCXDriver : public EpollDriver {
         }
 
         int read(int fd, char *rbuf, size_t bytes);
+        ucp_worker_h get_ucp_worker() const {
+            return ucp_worker;
+        }
+        int  get_ucp_fd() const {
+            return ucp_fd;
+        }
 };
 
 #endif //CEPH_UCXEVENT_H

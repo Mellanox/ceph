@@ -21,21 +21,30 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "UCXStack "
 
+#include <mutex>
+#include <map>
+#include <arpa/inet.h>
 
-UCXConnectedSocketImpl::UCXConnectedSocketImpl(UCXWorker *w) : worker(w)
+UCXGlobals UCXGl;
+
+
+UCXConnectedSocketImpl::UCXConnectedSocketImpl(UCXWorker *w,
+                                               ucp_ep_address_t *ep_addr)
+    : worker(w), ucp_ep_addr(ep_addr), ucp_ep(NULL), my_fd(0)
 {
 }
 
 void UCXConnectedSocketImpl::shutdown()
 {
-    ldout(cct(), 20) << __func__ << " conn fd: "
-                     << tcp_fd << " is shutting down..." << dendl;
+//    ldout(cct(), 20) << __func__ << " conn fd: "
+//                     << tcp_fd << " is shutting down..." << dendl;
 
+    /* TODO: ucp_ep_close_nb(SYNC) ? */
     /* Call for shutdown even ucp_ep doesn't exist yet */
-    if (tcp_fd > 0) {
+    if (my_fd > 0) {
         UCXDriver *driver = dynamic_cast<UCXDriver *>(worker->center.get_driver());
-       //::shutdown(tcp_fd, SHUT_RDWR); //Vasily: ????
-        driver->conn_shutdown(tcp_fd);
+//       //::shutdown(tcp_fd, SHUT_RDWR); //Vasily: ????
+        driver->conn_shutdown(my_fd);
     }
 }
 
@@ -43,15 +52,15 @@ void UCXConnectedSocketImpl::close()
 {
     UCXConnectedSocketImpl::shutdown();
 
-    if (tcp_fd > 0) {
-        ldout(cct(), 20) << __func__ << " fd: " << tcp_fd << dendl;
-
-        UCXDriver *driver = dynamic_cast<UCXDriver *>(worker->center.get_driver());
-        driver->conn_close(tcp_fd);
-
-        ::close(tcp_fd);
-        tcp_fd = -1;
-    }
+//    if (tcp_fd > 0) {
+//        ldout(cct(), 20) << __func__ << " fd: " << tcp_fd << dendl;
+//
+//        UCXDriver *driver = dynamic_cast<UCXDriver *>(worker->center.get_driver());
+//        driver->conn_close(tcp_fd);
+//
+//        ::close(tcp_fd);
+//        tcp_fd = -1;
+//    }
 }
 
 UCXConnectedSocketImpl::~UCXConnectedSocketImpl()
@@ -62,88 +71,78 @@ UCXConnectedSocketImpl::~UCXConnectedSocketImpl()
 int UCXConnectedSocketImpl::is_connected()
 {
     UCXDriver *driver = dynamic_cast<UCXDriver *>(worker->center.get_driver());
-    return driver->is_connected(tcp_fd);
+    return driver->is_connected(my_fd);
 }
 
 int UCXConnectedSocketImpl::connect(const entity_addr_t& peer_addr, const SocketOptions &opts)
 {
-    NetHandler net(cct());
-    int ret;
-
-    tcp_fd = net.connect(peer_addr, opts.connect_bind_addr);
-    if (tcp_fd < 0) {
-        lderr(cct()) << __func__ << " failed to allocate client socket" << dendl;
-        return -errno;
+//    NetHandler net(cct());
+//    int ret;
+//
+//    tcp_fd = net.connect(peer_addr, opts.connect_bind_addr);
+//    if (tcp_fd < 0) {
+//        lderr(cct()) << __func__ << " failed to allocate client socket" << dendl;
+//        return -errno;
+//    }
+//
+//
+//    if (ret < 0) {
+//        return ret;
+//    }
+    assert(ucp_ep == NULL);
+    assert(ucp_ep_addr == NULL);
+    ucp_ep_params_t ep_params;
+    ep_params.field_mask = UCP_EP_PARAM_FIELD_FLAGS |
+                           UCP_EP_PARAM_FIELD_SOCK_ADDR |
+                           UCP_EP_PARAM_FIELD_USER_DATA;
+    ep_params.user_data        = this;
+    ep_params.flags            = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER;
+    struct sockaddr_in addr;
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("1.1.75.1");
+    addr.sin_port        = peer_addr.get_port();
+    ep_params.sockaddr.addr    = (struct sockaddr*)&addr;//.sin_addr; peer_addr.get_sockaddr();
+    ep_params.sockaddr.addrlen = sizeof(struct sockaddr);
+//    ep_params.sockaddr.addr    = peer_addr.get_sockaddr();
+//    ep_params.sockaddr.addrlen = peer_addr.get_sockaddr_len();
+    ucs_status_t status = ucp_ep_create(worker->get_ucp_worker(), &ep_params, &ucp_ep);
+    ldout(cct(), 0) << __func__ << " creating UCP ep to addr: "
+                    << inet_ntoa(addr.sin_addr) << ":"
+                    << addr.sin_port << " status: "
+                    << ucs_status_string(status) << dendl;
+    if (status == UCS_OK) {
+        my_fd = UCXGl.get_fd(ucp_ep, worker->get_ucp_fd());
+        return worker->conn_establish(my_fd, ucp_ep);
     }
-
-    ldout(cct(), 20) << __func__<< " server addr: " << peer_addr << " tcp_fd: " << tcp_fd << dendl;
-    net.set_close_on_exec(tcp_fd);
-
-    ret = net.set_socket_options(tcp_fd, opts.nodelay, opts.rcbuf_size);
-    if (ret < 0) {
-        ::close(tcp_fd);
-        tcp_fd = -1;
-        lderr(cct()) << __func__ << " failed to set socket options" << dendl;
-        return -errno;
-    }
-
-    net.set_priority(tcp_fd, opts.priority, peer_addr.get_family()); //Vasily: ??????
-
-    ret = worker->conn_establish(tcp_fd);
-    if (ret < 0) {
-        return ret;
-    }
-
-    return 0;
+    return status;
 }
 
 int UCXConnectedSocketImpl::accept(int server_sock,
                                    entity_addr_t *out,
                                    const SocketOptions &opt)
 {
-    NetHandler net(cct());
-    int ret = 0;
-
-    sockaddr_storage ss;
-    socklen_t slen = sizeof(ss);
-
-    tcp_fd = ::accept(server_sock, (sockaddr*)&ss, &slen);
-    if (tcp_fd < 0) {
-        return -errno;
+    ucp_ep_params_t ep_params;
+    ep_params.field_mask  = UCP_EP_PARAM_FIELD_EP_ADDR;
+    ep_params.ep_addr     = ucp_ep_addr;
+    assert(ucp_ep == NULL);
+    ucs_status_t status = ucp_ep_create(worker->get_ucp_worker(), &ep_params,
+                                        &ucp_ep);
+    if (status == UCS_OK) {
+        my_fd = UCXGl.get_fd(ucp_ep, worker->get_ucp_fd());
+        return worker->conn_establish(my_fd, ucp_ep);
     }
-
-    net.set_close_on_exec(tcp_fd);
-
-    ret = net.set_socket_options(tcp_fd, opt.nodelay, opt.rcbuf_size);
-    if (ret < 0) {
-        ::close(tcp_fd);
-        tcp_fd = -1;
-
-        return -errno;
-    }
-
-    assert(NULL != out); //out should not be NULL in accept connection
-
-    out->set_sockaddr((sockaddr*)&ss);
-    net.set_priority(tcp_fd, opt.priority, out->get_family());
-
-    ret = worker->conn_establish(tcp_fd);
-    if (ret < 0) {
-        return ret;
-    }
-
-    return 0;
+    return status;
 }
 
-int UCXWorker::conn_establish(int fd)
+int UCXWorker::conn_establish(int fd, ucp_ep_h ep)
 {
-    return  driver->conn_establish(fd, ucp_addr, ucp_addr_len);
+    return driver->conn_establish(fd, ep);
 }
 
 ssize_t UCXConnectedSocketImpl::read(int fd_or_id, char *buf, size_t len)
 {
     UCXDriver *driver = dynamic_cast<UCXDriver *>(worker->center.get_driver());
-    return driver->read(tcp_fd, buf, len);
+    return driver->read(my_fd, buf, len);
 }
 
 ssize_t UCXConnectedSocketImpl::zero_copy_read(bufferptr&)
@@ -170,72 +169,73 @@ void UCXConnectedSocketImpl::request_cleanup(void *req)
 ssize_t UCXConnectedSocketImpl::send(bufferlist &bl, bool more)
 {
     UCXDriver *driver = dynamic_cast<UCXDriver *>(worker->center.get_driver());
-    return driver->send(tcp_fd, bl, more);
+    return driver->send(my_fd, bl, more);
 }
 
-UCXServerSocketImpl::UCXServerSocketImpl(UCXWorker *w) : worker(w)
+UCXServerSocketImpl::UCXServerSocketImpl(UCXWorker *w)
+    : worker(w), my_fd(UCXGl.get_fd(this))
 {
 }
 
 UCXServerSocketImpl::~UCXServerSocketImpl()
 {
-    if (server_setup_socket >= 0) {
-        ::close(server_setup_socket);
+    UCXGl.release_ss(this);
+    if (ucp_listener) {
+        ucp_listener_destroy(ucp_listener);
     }
 }
 
 int UCXServerSocketImpl::listen(entity_addr_t &sa, const SocketOptions &opt)
 {
-    int rc;
-    NetHandler net(cct());
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    assert(AF_INET == sa.get_family());
+    addr.sin_family      = AF_INET; // sa.get_family();       /* ? , */
+    addr.sin_addr.s_addr = inet_addr("1.1.75.1");// INADDR_ANY; //sai_p->sin_addr.s_addr;    /* ? INADDR_ANY, */
+//    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = sa.get_port();
 
-    server_setup_socket = net.create_socket(sa.get_family(), true);
-    if (server_setup_socket < 0) {
-        ldout(cct(), 1)  << __func__ << " failed to create server socket: "
-                         << cpp_strerror(errno) << dendl;
-        return -errno;
+    ucp_listener_params_t params;
+    params.field_mask         = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
+                                UCP_LISTENER_PARAM_FIELD_ACCEPT_HANDLER2;
+    params.sockaddr.addr      = reinterpret_cast<const struct sockaddr*>(&addr);
+    params.sockaddr.addrlen   = sizeof(addr);
+    params.accept_handler2.cb  = server_accept_cb;
+    params.accept_handler2.arg = this;
+
+    /* Create a listener on the server side to listen on the given address.*/
+    ucs_status_t status = ucp_listener_create(worker->get_ucp_worker(),
+                                              &params, &ucp_listener);
+    ldout(cct(), 0) << __func__ << " creating UCP listener to addr: "
+                    << inet_ntoa(addr.sin_addr) << ":"
+                    << addr.sin_port << " status: "
+                    << ucs_status_string(status) << dendl;
+
+    if (status == UCS_OK) {
+        return 0;
     }
 
-    rc = net.set_nonblock(server_setup_socket);
-    if (rc < 0) {
-        goto err;
-    }
-
-    net.set_close_on_exec(server_setup_socket);
-
-    rc = ::bind(server_setup_socket, sa.get_sockaddr(), sa.get_sockaddr_len());
-    if (rc < 0) {
-        ldout(cct(), 10) << __func__ << " unable to bind to " << sa.get_sockaddr()
-                         << " on port " << sa.get_port() << ": " << cpp_strerror(errno) << dendl;
-        goto err;
-    }
-
-    rc = ::listen(server_setup_socket, 128);
-    if (rc < 0) {
-        lderr(cct()) << __func__ << " unable to listen on " << sa << ": " << cpp_strerror(errno) << dendl;
-        goto err;
-    }
-
-    ldout(cct(), 20) << __func__ << " bind server addr " << sa
-                     << " to server socket " << server_setup_socket << dendl;
-
-    return 0;
-
-err:
-    ::close(server_setup_socket);
-    server_setup_socket = -1;
-
-    return -errno;
+    fprintf(stderr, "failed to listen (%s)\n", ucs_status_string(status));
+    ucp_listener = NULL;
+    return status;
 }
 
-int UCXServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &opt, entity_addr_t *out, Worker *w)
+int UCXServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &opt,
+                                entity_addr_t *out, Worker *w)
 {
-    UCXConnectedSocketImpl *p = new UCXConnectedSocketImpl(dynamic_cast<UCXWorker *>(w));
+    UCXDriver *driver = dynamic_cast<UCXDriver *>(worker->center.get_driver());
+    if (!driver->has_conn_reqs()) {
+        return -EAGAIN;
+    }
 
-    int r = p->accept(server_setup_socket, out, opt);
+    UCXConnectedSocketImpl *p =
+        new UCXConnectedSocketImpl(dynamic_cast<UCXWorker *>(w),
+                                   driver->conn_dequeue(my_fd).second);
+
+    int r = p->accept(-1, out, opt);
     if (r < 0) {
         ldout(cct(), 1) << __func__ << " accept failed on server socket: "
-                        << server_setup_socket << dendl;
+                        << worker->get_ucp_fd() << dendl;
         delete p;
 
         return r;
@@ -249,11 +249,13 @@ int UCXServerSocketImpl::accept(ConnectedSocket *sock, const SocketOptions &opt,
 
 void UCXServerSocketImpl::abort_accept()
 {
-    if (server_setup_socket >= 0) {
-        ::close(server_setup_socket);
+    assert(0);
+    if (ucp_listener) {
+        /* TODO: ???*/;
+        ucp_listener_destroy(ucp_listener);
     }
 
-    server_setup_socket = -1;
+    ucp_listener = NULL;
 }
 
 UCXWorker::UCXWorker(CephContext *c, unsigned i) : Worker(c, i)
